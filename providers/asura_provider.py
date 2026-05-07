@@ -62,15 +62,6 @@ class AsuraProvider(BaseProvider):
         except Exception as e:
             print(f"Asura images error: {e}")
             return []
-                        if cleaned not in images:
-                            images.append(cleaned)
-                    if images:
-                        break
-
-            return images
-        except Exception as e:
-            print(f"AsuraProvider Error: {e}")
-            return []
 
     async def get_all_chapters(self, series_url):
         try:
