@@ -1,0 +1,14 @@
+discord.py
+google-generativeai>=0.5.0
+python-binance
+python-dotenv
+aiosqlite
+aiohttp
+tavily-python
+cloudscraper
+beautifulsoup4
+Flask
+Pillow
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
