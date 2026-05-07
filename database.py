@@ -125,6 +125,15 @@ async def update_tracker_time(tracker_id, last_checked_str):
         await db.execute("UPDATE trackers SET last_checked = ? WHERE tracker_id = ?", (last_checked_str, tracker_id))
         await db.commit()
 
+async def update_tracker_chapter(tracker_id, new_chapter, last_checked_str):
+    """تحديث رقم الفصل الأخير ووقت الفحص معاً"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE trackers SET last_chapter = ?, last_checked = ? WHERE tracker_id = ?",
+            (new_chapter, last_checked_str, tracker_id)
+        )
+        await db.commit()
+
 async def add_price_alert(user_id, symbol, target_price, condition):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
