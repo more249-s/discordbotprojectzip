@@ -2,101 +2,180 @@ import asyncio
 from .generic_provider import GenericProvider
 from .madara_provider import MadaraProvider
 from .asura_provider import AsuraProvider
+from .vortex_provider import VortexProvider
+from .qimanhwa_provider import QimanhwaProvider
 from .mangapill_provider import MangaPillProvider
 from .manganato_provider import ManganatoProvider
 from .webtoons_provider import WebtoonsProvider
 from .weebcentral_provider import WeebCentralProvider
 from .naver_provider import NaverProvider
+from .mangadex_provider import MangaDexProvider
+from .tcbscans_provider import TCBScansProvider
 from .gemini_provider import GeminiProvider
 from gemini_client import GeminiClient
 from typing import List, Optional
+
 
 class ProviderManager:
     def __init__(self):
         self.generic = GenericProvider()
         self.madara = MadaraProvider(scraper=self.generic.scraper)
         self.asura = AsuraProvider()
+        self.vortex = VortexProvider()
+        self.qimanhwa = QimanhwaProvider()
         self.mangapill = MangaPillProvider()
         self.manganato = ManganatoProvider()
         self.webtoons = WebtoonsProvider()
         self.weebcentral = WeebCentralProvider()
         self.naver = NaverProvider()
-        
-        # نستخدم عميل جيميناي كنظام احتياطي للمواقع الصعبة
+        self.mangadex = MangaDexProvider()
+        self.tcbscans = TCBScansProvider()
+
         self.gemini_client = GeminiClient()
         self.gemini_fallback = GeminiProvider(self.gemini_client, scraper=self.generic.scraper)
-        
-        # قائمة المواقع التي نعرف يقيناً أنها تستخدم Madara
-        self.madara_sites = [
-            "asurascans", "vortexscans", "mangapro", "mangaonlineteam", "manhuaplus", "toonily", "manhuafast", "webtoon.xyz"
-        ]
+
         self.manganato_sites = [
             "manganato", "mangakakalot", "manganelo", "chapmanganato"
         ]
 
+        # مواقع تستخدم Madara أو بنية مشابهة
+        self.madara_sites = [
+            "toonily", "manhuaplus", "manhuafast", "webtoon.xyz",
+            "mangaonlineteam", "mangapro",
+            "utoon.net", "utoon.co",
+            "flamescans", "flamecomics",
+            "reaperscans", "reapercomics",
+            "luminousscans",
+            "isekaiscan",
+            "azuremanga", "aquamanga",
+            "247manga", "mangabaz",
+            "zinmanga", "mangatx",
+            "kunmanga", "topmanhua",
+            "manhuaus", "1stkissmanga",
+            "s2manga", "infernalvoid",
+        ]
+
     def get_provider(self, url: str):
         url_lower = url.lower()
-        
-        if "asura" in url_lower:
+
+        if "mangadex.org" in url_lower:
+            return self.mangadex
+
+        if any(x in url_lower for x in ["asurascans", "asura.gg", "asuracomics", "asuratoon"]):
             return self.asura
+
+        if "vortexscans" in url_lower:
+            return self.vortex
+
+        if any(x in url_lower for x in ["qimanhwa", "qimanhua"]):
+            return self.qimanhwa
+
         if "mangapill" in url_lower:
             return self.mangapill
-        
-        for site in self.manganato_sites:
-            if site in url_lower:
-                return self.manganato
-        
+
+        if any(s in url_lower for s in self.manganato_sites):
+            return self.manganato
+
         if "webtoons.com" in url_lower:
             return self.webtoons
-            
+
         if "comic.naver.com" in url_lower:
             return self.naver
-            
+
         if "weebcentral.com" in url_lower:
             return self.weebcentral
-            
-        for site in self.madara_sites:
-            if site in url_lower:
-                return self.madara
-        
+
+        if any(x in url_lower for x in ["tcbscans", "tcb-scans"]):
+            return self.tcbscans
+
+        if any(s in url_lower for s in self.madara_sites):
+            return self.madara
+
         return self.generic
 
     async def get_latest_chapter(self, url: str) -> Optional[float]:
         provider = self.get_provider(url)
-        # Check if provider method is async
-        if asyncio.iscoroutinefunction(provider.get_latest_chapter):
-            chapter = await provider.get_latest_chapter(url)
-        else:
-            loop = asyncio.get_event_loop()
-            chapter = await loop.run_in_executor(None, provider.get_latest_chapter, url)
-        
-        if chapter is None:
-            print(f"⚠️ فشل المزود العادي، محاولة استخدام Gemini لموقع {url}")
-            chapter = await self.gemini_fallback.get_latest_chapter_async(url)
-        return chapter
+        try:
+            if asyncio.iscoroutinefunction(provider.get_latest_chapter):
+                chapter = await provider.get_latest_chapter(url)
+            else:
+                loop = asyncio.get_event_loop()
+                chapter = await loop.run_in_executor(None, provider.get_latest_chapter, url)
+            if chapter is not None:
+                return chapter
+        except Exception as e:
+            print(f"[ProviderManager] get_latest_chapter error: {e}")
+
+        # Fallback: generic
+        if provider is not self.generic:
+            try:
+                loop = asyncio.get_event_loop()
+                chapter = await loop.run_in_executor(None, self.generic.get_latest_chapter, url)
+                if chapter is not None:
+                    return chapter
+            except Exception:
+                pass
+
+        print(f"⚠️ فشل المزود الرئيسي، جاري تجربة Gemini لـ {url}")
+        try:
+            return await self.gemini_fallback.get_latest_chapter_async(url)
+        except Exception:
+            return None
 
     async def get_images(self, url: str) -> List[str]:
         provider = self.get_provider(url)
-        if asyncio.iscoroutinefunction(provider.get_images):
-            images = await provider.get_images(url)
-        else:
-            loop = asyncio.get_event_loop()
-            images = await loop.run_in_executor(None, provider.get_images, url)
-        
+        images = []
+        try:
+            if asyncio.iscoroutinefunction(provider.get_images):
+                images = await provider.get_images(url)
+            else:
+                loop = asyncio.get_event_loop()
+                images = await loop.run_in_executor(None, provider.get_images, url)
+        except Exception as e:
+            print(f"[ProviderManager] get_images error: {e}")
+
+        if not images and provider is not self.generic:
+            print(f"⚠️ فشل {type(provider).__name__}، جاري تجربة GenericProvider...")
+            try:
+                loop = asyncio.get_event_loop()
+                images = await loop.run_in_executor(None, self.generic.get_images, url)
+            except Exception:
+                pass
+
         if not images:
             print(f"⚠️ فشل جلب الصور بالطريقة العادية، جاري استخدام Gemini لـ {url}")
-            images = await self.gemini_fallback.get_images_async(url)
-        return images
+            try:
+                images = await self.gemini_fallback.get_images_async(url)
+            except Exception:
+                pass
+
+        return images or []
 
     async def get_all_chapters(self, url: str) -> dict:
         provider = self.get_provider(url)
-        if asyncio.iscoroutinefunction(provider.get_all_chapters):
-            chapters = await provider.get_all_chapters(url)
-        else:
-            loop = asyncio.get_event_loop()
-            chapters = await loop.run_in_executor(None, provider.get_all_chapters, url)
-        
+        chapters = {}
+        try:
+            if asyncio.iscoroutinefunction(provider.get_all_chapters):
+                chapters = await provider.get_all_chapters(url)
+            else:
+                loop = asyncio.get_event_loop()
+                chapters = await loop.run_in_executor(None, provider.get_all_chapters, url)
+        except Exception as e:
+            print(f"[ProviderManager] get_all_chapters error: {e}")
+
+        if not chapters and provider is not self.generic:
+            print(f"⚠️ فشل {type(provider).__name__}، جاري تجربة GenericProvider...")
+            try:
+                loop = asyncio.get_event_loop()
+                chapters = await loop.run_in_executor(None, self.generic.get_all_chapters, url)
+            except Exception:
+                pass
+
         if not chapters:
-            print(f"⚠️ فشل استخراج الفصول بالطريقة العادية، جاري استخدام Gemini لـ {url}")
-            chapters = await self.gemini_fallback.get_all_chapters_async(url)
-        return chapters
+            print(f"⚠️ فشل استخراج الفصول، جاري استخدام Gemini لـ {url}")
+            try:
+                chapters = await self.gemini_fallback.get_all_chapters_async(url)
+            except Exception:
+                pass
+
+        return chapters or {}

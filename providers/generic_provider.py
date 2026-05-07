@@ -1,77 +1,111 @@
-from .base_provider import BaseProvider
-from bs4 import BeautifulSoup
 import re
+import json
+from bs4 import BeautifulSoup
+from .base_provider import BaseProvider
+from urllib.parse import urljoin, urlparse
 from typing import List, Optional
 
+
 class GenericProvider(BaseProvider):
-    def _fetch_html_with_diagnostics(self, url: str) -> Optional[str]:
-        html = self.fetch_html(url)
-        if html:
-            return html
-        try:
-            resp = self.scraper.get(url, timeout=20)
-            if resp.status_code == 403 and "just a moment" in resp.text.lower():
-                print(f"Cloudflare challenge blocked this URL: {url}")
-            elif resp.status_code >= 400:
-                print(f"HTTP {resp.status_code} while fetching: {url}")
-        except Exception:
-            pass
-        return None
+    """مزود عام ذكي يجرب عدة طرق تلقائياً"""
 
     def get_latest_chapter(self, url: str) -> Optional[float]:
         chapters = self.get_all_chapters(url)
-        if chapters:
-            return max(chapters.keys())
-        return None
+        return max(chapters.keys()) if chapters else None
 
     def get_all_chapters(self, url: str) -> dict:
-        html = self._fetch_html_with_diagnostics(url)
-        if not html: return {}
-        
+        html = self.fetch_html(url)
+        if not html:
+            return {}
+
         soup = BeautifulSoup(html, 'html.parser')
         chapters = {}
-        
-        # البحث في كل الروابط للحصول على رقم الفصل والرابط الخاص به
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
         for a in soup.find_all('a'):
             href = a.get('href')
-            if not href: continue
-            
+            if not href:
+                continue
+            if not href.startswith('http'):
+                href = urljoin(base, href)
+
             text = a.get_text(strip=True)
             val = self.extract_chapter_number(text)
+            if val is None:
+                m = re.search(r'chapter[s]?[-/](\d+(?:\.\d+)?)', href, re.I)
+                if m:
+                    try:
+                        val = float(m.group(1))
+                    except Exception:
+                        pass
             if val is not None:
-                # نحتفظ بالرابط، ولكننا نحتاج التأكد من أنه رابط كامل
-                if href.startswith('/'):
-                    from urllib.parse import urlparse
-                    parsed_url = urlparse(url)
-                    href = f"{parsed_url.scheme}://{parsed_url.netloc}{href}"
-                
                 chapters[val] = href
-        
+
         return chapters
 
     def get_images(self, url: str) -> List[str]:
-        html = self._fetch_html_with_diagnostics(url)
-        if not html: return []
-        
+        html = self.fetch_html(url)
+        if not html:
+            return []
+
         soup = BeautifulSoup(html, 'html.parser')
-        img_urls = []
-        
-        # البحث عن منطقة القراءة الشائعة
-        reader_area = soup.find('div', id='readerarea') or \
-                      soup.find('div', class_='rdminimal') or \
-                      soup.find('div', class_='canvas-container')
-        
-        if reader_area:
-            imgs = reader_area.find_all('img')
-            for img in imgs:
-                src = img.get('data-src') or img.get('src')
-                if src and src.startswith('http'):
-                    img_urls.append(src)
-        else:
-            # محاولة أخيرة: البحث عن أي صورة كبيرة
-            for img in soup.find_all('img'):
-                src = img.get('data-src') or img.get('src')
-                if src and ('wp-content/uploads' in src or 'manga' in src):
-                    img_urls.append(src)
-        
-        return list(dict.fromkeys(img_urls))
+        images = []
+
+        # 1. محاولة __NEXT_DATA__
+        next_data = soup.find('script', id='__NEXT_DATA__')
+        if next_data:
+            try:
+                text = json.dumps(json.loads(next_data.string))
+                images = self._extract_images_regex(text)
+                if images:
+                    return images
+            except Exception:
+                pass
+
+        # 2. سلكتورات شائعة
+        selectors = [
+            '#readerarea', '.rdminimal', '.chapter-content',
+            '.reading-content', '.canvas-container', '[class*="reader"]',
+            '[id*="reader"]', '.page-break',
+        ]
+        for sel in selectors:
+            div = soup.select_one(sel)
+            if not div:
+                continue
+            for img in div.find_all('img'):
+                src = (img.get('data-src') or img.get('src') or '').strip()
+                if src.startswith('http') and src not in images:
+                    images.append(src)
+            if images:
+                return images
+
+        # 3. regex على الـ scripts
+        for script in soup.find_all('script'):
+            content = script.string or ''
+            if any(x in content for x in ['.webp', '.jpg', '.jpeg', '.png']):
+                found = self._extract_images_regex(content)
+                images.extend(f for f in found if f not in images)
+        if images:
+            return images
+
+        # 4. regex على كامل HTML
+        images = self._extract_images_regex(html)
+        return images
+
+    def _extract_images_regex(self, text: str) -> list:
+        images = []
+        patterns = [
+            r'"src"\s*:\s*"(https?://[^"]+\.(?:webp|jpg|jpeg|png)[^"]*)"',
+            r'"url"\s*:\s*"(https?://[^"]+\.(?:webp|jpg|jpeg|png)[^"]*)"',
+            r'https?://[a-zA-Z0-9\-_.]+/[^"\'\s<>]+?\.(?:webp|jpg|jpeg|png)(?:\?[^"\'\s<>]*)?',
+        ]
+        for pattern in patterns:
+            for match in re.findall(pattern, text, re.IGNORECASE):
+                if isinstance(match, tuple):
+                    match = match[0]
+                cleaned = match.replace('\\u002F', '/').replace('\\', '').strip().rstrip('"')
+                if cleaned.startswith('http') and cleaned not in images:
+                    if not any(x in cleaned.lower() for x in ['logo', 'avatar', 'icon', 'banner', 'cover', 'ads', 'thumb']):
+                        images.append(cleaned)
+        return images

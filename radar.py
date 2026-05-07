@@ -11,6 +11,9 @@ import os
 from typing import Optional, List
 from manga_downloader import MangaDownloader
 
+# عدد الفصول التي يتحقق منها الرادار بشكل متوازٍ
+RADAR_CONCURRENT = 5
+
 class MangaPanelView(ui.View):
     def __init__(self, bot, downloader, provider_manager, series_url, chapters_dict):
         super().__init__(timeout=900)
@@ -285,58 +288,91 @@ class RadarCog(commands.Cog):
         await self.bot.wait_until_ready()
         now = datetime.datetime.now(datetime.timezone.utc)
         trackers = await database.get_all_trackers()
-        
+
         if not trackers:
             return
 
-        print(f"--- [الرادار] جاري بدء فحص {len(trackers)} أعمال الآن ---")
-        
-        for tracker_id, guild_id, channel_id, url, last_chapter, custom_msg, interval_hours, last_checked_str, download_enabled in trackers:
+        # فلترة المتتبعات التي حان وقت فحصها
+        due = []
+        for row in trackers:
+            tracker_id, guild_id, channel_id, url, last_chapter, custom_msg, interval_hours, last_checked_str, download_enabled = row
             try:
                 last_checked = datetime.datetime.fromisoformat(last_checked_str)
-                if (now - last_checked) < datetime.timedelta(hours=interval_hours):
-                    continue
-                    
-                print(f"🔍 [الرادار] فحص: {url}")
-                
-                latest_chapter = await self.fetch_latest_chapter(url, last_chapter)
-                
-                if latest_chapter and latest_chapter > last_chapter:
-                    print(f"✅ [الرادار] فصل جديد! {latest_chapter} (القديم: {last_chapter})")
-                    
-                    gofile_link = None
-                    if download_enabled:
-                        print(f"📥 [الرادار] جاري تحميل الفصل {latest_chapter}...")
-                        chapter_title = f"Ch_{latest_chapter}_{url.split('/')[-2]}"
-                        zip_path = await self.downloader.download_and_stitch(url, chapter_title)
-                        if zip_path:
-                            print(f"📤 [الرادار] جاري الرفع إلى Google Drive...")
-                            gofile_link = await self.downloader.upload_to_gdrive(zip_path, os.path.basename(zip_path))
-                            if not gofile_link:
-                                print(f"⚠️ فشل Google Drive، جاري محاولة Gofile...")
-                                gofile_link = await self.downloader.upload_to_gofile(zip_path)
-                            self.downloader.cleanup(zip_path)
+                if (now - last_checked) >= datetime.timedelta(hours=interval_hours):
+                    due.append(row)
+            except Exception:
+                due.append(row)
 
-                    channel = self.bot.get_channel(channel_id)
-                    if channel:
-                        embed = discord.Embed(
-                            title="🚨 فصل جديد متاح!", 
-                            description=f"تم العثور على **الفصل {latest_chapter}**\n\n[رابط الموقع]({url})", 
-                            color=discord.Color.red()
-                        )
-                        if gofile_link:
-                            embed.add_field(name="📥 رابط تحميل مباشر (Gofile)", value=f"[اضغط هنا للتحميل]({gofile_link})")
-                        
-                        embed.set_footer(text="تم إيقاف متابعة هذا العمل تلقائياً.")
-                        await channel.send(content=custom_msg, embed=embed)
-                        print(f"📢 [الرادار] تم إرسال التنبيه!")
-                    
-                    await database.remove_tracker(tracker_id, guild_id)
-                else:
+        if not due:
+            return
+
+        print(f"--- [الرادار] فحص {len(due)} عمل من أصل {len(trackers)} ---")
+
+        semaphore = asyncio.Semaphore(RADAR_CONCURRENT)
+
+        async def check_one(row):
+            tracker_id, guild_id, channel_id, url, last_chapter, custom_msg, interval_hours, last_checked_str, download_enabled = row
+            async with semaphore:
+                try:
+                    print(f"🔍 [الرادار] فحص: {url}")
+                    latest_chapter = await self.fetch_latest_chapter(url, last_chapter)
+
+                    if latest_chapter and latest_chapter > last_chapter:
+                        print(f"✅ [الرادار] فصل جديد! {latest_chapter} (القديم: {last_chapter})")
+
+                        download_link = None
+                        if download_enabled:
+                            print(f"📥 [الرادار] جاري تحميل الفصل {latest_chapter}...")
+                            # بناء رابط الفصل الجديد تلقائياً
+                            chapter_url = self._build_chapter_url(url, latest_chapter)
+                            chapter_title = f"Ch_{latest_chapter}_{url.rstrip('/').split('/')[-1]}"
+                            zip_path = await self.downloader.download_and_stitch(chapter_url, chapter_title)
+                            if zip_path:
+                                print(f"📤 [الرادار] جاري الرفع...")
+                                download_link = await self.downloader.upload_to_gdrive(zip_path, os.path.basename(zip_path))
+                                if not download_link:
+                                    download_link = await self.downloader.upload_to_gofile(zip_path)
+                                self.downloader.cleanup(zip_path)
+
+                        channel = self.bot.get_channel(channel_id)
+                        if channel:
+                            embed = discord.Embed(
+                                title="🚨 فصل جديد متاح!",
+                                description=(
+                                    f"تم رصد **الفصل {latest_chapter}**\n"
+                                    f"(كان آخر فصل: {last_chapter})\n\n"
+                                    f"[رابط الموقع]({url})"
+                                ),
+                                color=discord.Color.red(),
+                                timestamp=now,
+                            )
+                            if download_link:
+                                embed.add_field(name="📥 تحميل مباشر", value=f"[اضغط هنا]({download_link})", inline=False)
+                            embed.set_footer(text="الرادار يواصل المتابعة تلقائياً للفصل التالي")
+                            await channel.send(content=custom_msg, embed=embed)
+                            print(f"📢 [الرادار] تم إرسال التنبيه لـ {channel.name}!")
+
+                        # تحديث رقم الفصل بدلاً من حذف المتتبع
+                        await database.update_tracker_chapter(tracker_id, latest_chapter, now.isoformat())
+                    else:
+                        await database.update_tracker_time(tracker_id, now.isoformat())
+
+                except Exception as e:
+                    print(f"❌ [الرادار] خطأ للآي دي {tracker_id}: {e}")
                     await database.update_tracker_time(tracker_id, now.isoformat())
-                    
-            except Exception as e:
-                print(f"❌ [الرادار] خطأ للآي دي {tracker_id}: {e}")
+
+        await asyncio.gather(*[check_one(row) for row in due])
+
+    def _build_chapter_url(self, series_url: str, chapter_num: float) -> str:
+        """محاولة بناء رابط الفصل الجديد من رابط السلسلة"""
+        # إذا كان الرابط يحتوي على رقم فصل بالفعل، نستبدله
+        import re
+        num_str = str(int(chapter_num)) if float(chapter_num).is_integer() else str(chapter_num)
+        # أنماط شائعة
+        new_url = re.sub(r'(chapter[s]?[-/])(\d+(?:\.\d+)?)', rf'\g<1>{num_str}', series_url, flags=re.I)
+        if new_url != series_url:
+            return new_url
+        return series_url
 
     @app_commands.command(name="track_add", description="[أدمن] إضافة عمل للمتابعة (رادار الفصول).")
     @app_commands.describe(
