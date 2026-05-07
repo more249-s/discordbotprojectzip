@@ -34,25 +34,37 @@ class ProviderManager:
         self.gemini_client = GeminiClient()
         self.gemini_fallback = GeminiProvider(self.gemini_client, scraper=self.generic.scraper)
 
+        # مواقع Manganato
         self.manganato_sites = [
-            "manganato", "mangakakalot", "manganelo", "chapmanganato"
+            "manganato", "mangakakalot", "manganelo", "chapmanganato",
         ]
 
-        # مواقع تستخدم Madara أو بنية مشابهة
+        # مواقع تعتمد على Madara WordPress أو بنية مشابهة
         self.madara_sites = [
+            # مواقع كورية / ترجمة إنجليزية شهيرة
             "toonily", "manhuaplus", "manhuafast", "webtoon.xyz",
             "mangaonlineteam", "mangapro",
             "utoon.net", "utoon.co",
-            "flamescans", "flamecomics",
-            "reaperscans", "reapercomics",
-            "luminousscans",
-            "isekaiscan",
-            "azuremanga", "aquamanga",
-            "247manga", "mangabaz",
-            "zinmanga", "mangatx",
-            "kunmanga", "topmanhua",
-            "manhuaus", "1stkissmanga",
-            "s2manga", "infernalvoid",
+            # Flame / Reaper / Luminous
+            "flamescans.org", "flamecomics.xyz", "flamecomics.me",
+            "reaperscans.com", "reapercomics.com",
+            "luminousscans.net", "luminousscans.com",
+            # مواقع أخرى شهيرة
+            "isekaiscan.com", "isekaiscan.to",
+            "azuremanga.com", "aquamanga.com",
+            "247manga.com", "mangabaz.net",
+            "zinmanga.com", "mangatx.com",
+            "kunmanga.com", "topmanhua.com",
+            "manhuaus.com", "1stkissmanga.io",
+            "s2manga.com", "infernalvoidscans.com",
+            "manhwaclan.com", "manhwatop.com",
+            "toongod.org", "mangaclash.com",
+            "nightscans.net", "disasterscans.com",
+            "biblioscan.me", "rawkuma.com",
+            "manga68.com", "manhua88.com",
+            "manhuazone.net", "manhuafast.com",
+            "chapscans.com", "drake-scans.com",
+            "void-scans.com", "asura.nacm.xyz",
         ]
 
     def get_provider(self, url: str):
@@ -61,13 +73,13 @@ class ProviderManager:
         if "mangadex.org" in url_lower:
             return self.mangadex
 
-        if any(x in url_lower for x in ["asurascans", "asura.gg", "asuracomics", "asuratoon"]):
+        if any(x in url_lower for x in ["asurascans", "asura.gg", "asuracomics", "asuratoon", "asura.nacm.xyz"]):
             return self.asura
 
         if "vortexscans" in url_lower:
             return self.vortex
 
-        if any(x in url_lower for x in ["qimanhwa", "qimanhua"]):
+        if any(x in url_lower for x in ["qimanhwa", "qimanhua", "qi manhwa"]):
             return self.qimanhwa
 
         if "mangapill" in url_lower:
@@ -88,10 +100,15 @@ class ProviderManager:
         if any(x in url_lower for x in ["tcbscans", "tcb-scans"]):
             return self.tcbscans
 
+        # Madara-based sites
         if any(s in url_lower for s in self.madara_sites):
             return self.madara
 
         return self.generic
+
+    def get_provider_name(self, url: str) -> str:
+        p = self.get_provider(url)
+        return type(p).__name__.replace("Provider", "")
 
     async def get_latest_chapter(self, url: str) -> Optional[float]:
         provider = self.get_provider(url)
@@ -106,7 +123,6 @@ class ProviderManager:
         except Exception as e:
             print(f"[ProviderManager] get_latest_chapter error: {e}")
 
-        # Fallback: generic
         if provider is not self.generic:
             try:
                 loop = asyncio.get_event_loop()
@@ -116,7 +132,7 @@ class ProviderManager:
             except Exception:
                 pass
 
-        print(f"⚠️ فشل المزود الرئيسي، جاري تجربة Gemini لـ {url}")
+        print(f"⚠️ كل المزودات فشلت، جاري تجربة Gemini...")
         try:
             return await self.gemini_fallback.get_latest_chapter_async(url)
         except Exception:
@@ -143,7 +159,7 @@ class ProviderManager:
                 pass
 
         if not images:
-            print(f"⚠️ فشل جلب الصور بالطريقة العادية، جاري استخدام Gemini لـ {url}")
+            print(f"⚠️ فشل جلب الصور، جاري استخدام Gemini...")
             try:
                 images = await self.gemini_fallback.get_images_async(url)
             except Exception:
@@ -172,7 +188,7 @@ class ProviderManager:
                 pass
 
         if not chapters:
-            print(f"⚠️ فشل استخراج الفصول، جاري استخدام Gemini لـ {url}")
+            print(f"⚠️ فشل استخراج الفصول، جاري استخدام Gemini...")
             try:
                 chapters = await self.gemini_fallback.get_all_chapters_async(url)
             except Exception:
