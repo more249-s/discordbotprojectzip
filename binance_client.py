@@ -11,11 +11,15 @@ class BinanceMonitor:
         self.client = None
 
     async def start(self):
-        self.client = await AsyncClient.create(self.api_key, self.api_secret)
+        try:
+            self.client = await AsyncClient.create(self.api_key, self.api_secret)
+        except Exception as e:
+            print(f"Warning: Binance connection failed (may be geo-restricted): {e}")
+            self.client = None
 
     async def check_deposits(self):
         if not self.client:
-            await self.start()
+            return []
         
         try:
             # Get deposit history
@@ -37,6 +41,8 @@ class BinanceMonitor:
             return []
 
     async def check_withdrawals(self):
+        if not self.client:
+            return []
         try:
             withdrawals = await self.client.get_withdraw_history()
             new_withdraws = []
@@ -53,6 +59,8 @@ class BinanceMonitor:
             return []
 
     async def get_symbol_price(self, symbol):
+        if not self.client:
+            return None
         try:
             res = await self.client.get_symbol_ticker(symbol=symbol.upper())
             return res['price']
