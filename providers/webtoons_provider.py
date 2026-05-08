@@ -40,10 +40,52 @@ class WebtoonsProvider(BaseProvider):
             print(f"Webtoons images error: {e}")
             return []
 
+    async def get_chapters_with_lock_info(self, series_url: str) -> dict:
+        """جلب الفصول مع كشف الفصول المقفلة (Daily Pass / Coins)"""
+        try:
+            all_chs = await self.get_all_chapters(series_url)
+
+            response = self.scraper.get(series_url, headers=self.headers, timeout=15)
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            locked_nums = set()
+            def check_soup(s):
+                items = s.select('#_listUl li')
+                for li in items:
+                    is_locked = bool(li.select('.ico_lock, .ico_pay, .ico_clock, .ico_waiting, .ico_pass'))
+                    if is_locked:
+                        a = li.find('a')
+                        if a:
+                            href = a.get('href', '')
+                            m = re.search(r'episode_no=(\d+)', href)
+                            if m:
+                                locked_nums.add(float(m.group(1)))
+
+            check_soup(soup)
+            # التحقق من الصفحات الأخرى للأقفال
+            for page in range(2, 5):
+                p_url = f"{series_url.rstrip('/')}&page={page}" if '?' in series_url else f"{series_url.rstrip('/')}?page={page}"
+                try:
+                    r = self.scraper.get(p_url, headers=self.headers, timeout=10)
+                    if r.status_code == 200:
+                        check_soup(BeautifulSoup(r.text, 'html.parser'))
+                    else: break
+                except: break
+
+            result = {}
+            for num, url in all_chs.items():
+                result[num] = {
+                    "url": url,
+                    "locked": num in locked_nums
+                }
+            return result
+        except Exception as e:
+            print(f"Webtoons lock info error: {e}")
+            chs = await self.get_all_chapters(series_url)
+            return {n: {"url": u, "locked": False} for n, u in chs.items()}
+
     async def get_all_chapters(self, series_url):
         try:
-            # استخراج title_no من الرابط
-            # مثال: https://www.webtoons.com/en/fantasy/tower-of-god/list?title_no=95
             parsed_url = urlparse(series_url)
             from urllib.parse import parse_qs
             qs = parse_qs(parsed_url.query)
@@ -54,13 +96,10 @@ class WebtoonsProvider(BaseProvider):
                 if match: title_no = match.group(1)
 
             if title_no:
-                # استخدام الـ Mobile API المكتشف!
-                # نحدد النوع (webtoon أو canvas)
                 webtoon_type = "canvas" if "canvas" in series_url else "webtoon"
                 api_url = f"https://m.webtoons.com/api/v1/{webtoon_type}/{title_no}"
                 
                 try:
-                    # نحتاج UA خاص بالجوال للـ API
                     mobile_headers = self.headers.copy()
                     mobile_headers['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1'
                     resp = self.scraper.get(api_url, headers=mobile_headers, timeout=10)
@@ -70,8 +109,6 @@ class WebtoonsProvider(BaseProvider):
                         chapters = {}
                         for ep in episodes:
                             num = ep.get('episodeNo')
-                            # بناء رابط المشاهدة (Viewer URL)
-                            # الرابط يكون عادة: /en/fantasy/tower-of-god/viewer?title_no=95&episode_no=1
                             viewer_path = ep.get('viewerLink')
                             if viewer_path:
                                 ch_url = urljoin("https://www.webtoons.com", viewer_path)
@@ -79,21 +116,26 @@ class WebtoonsProvider(BaseProvider):
                         if chapters: return chapters
                 except: pass
 
-            # Fallback للـ Scraping التقليدي
+            def _extract(html, b_url):
+                s = BeautifulSoup(html, 'html.parser')
+                res = {}
+                items = s.select('#_listUl li')
+                for li in items:
+                    a = li.find('a')
+                    if not a: continue
+                    href = a.get('href')
+                    ep_match = re.search(r'episode_no=(\d+)', href)
+                    if ep_match:
+                        num = float(ep_match.group(1))
+                        res[num] = urljoin(b_url, href)
+                return res
+
             response = self.scraper.get(series_url, headers=self.headers, timeout=15)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            chapters = {}
-            # سلكتورز قائمة الفصول
-            items = soup.select('#_listUl li')
-            for li in items:
-                a = li.find('a')
-                if not a: continue
-                href = a.get('href')
-                # استخراج رقم الحلقة من الـ ID أو النص
-                ep_match = re.search(r'episode_no=(\d+)', href)
-                if ep_match:
-                    num = float(ep_match.group(1))
-                    chapters[num] = urljoin(series_url, href)
+            chapters = _extract(response.text, series_url)
+
+            extra = self._paginate_chapters(series_url, _extract)
+            chapters.update(extra)
+
             return chapters
         except Exception as e:
             print(f"Webtoons chapters error: {e}")

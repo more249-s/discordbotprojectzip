@@ -29,11 +29,11 @@ RANK_COLORS = {
 
 
 # ── جلب رتبة المستخدم ──────────────────────────────────────────────────────
-async def get_rank(user_id: int) -> int:
+async def get_rank(user_id: int, auto_register: bool = True) -> int:
     """إرجاع رتبة المستخدم (0-3)."""
     if user_id in Config.ALLOWED_USER_IDS:
         return 3
-    return await database.get_user_rank(user_id)
+    return await database.get_user_rank(user_id, auto_register=auto_register)
 
 
 def is_owner(user_id: int) -> bool:

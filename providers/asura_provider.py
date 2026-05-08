@@ -112,8 +112,6 @@ class AsuraProvider(BaseProvider):
                 try:
                     data = json.loads(next_data.string)
                     text = json.dumps(data)
-                    for m in re.finditer(r'"slug"\s*:\s*"([^"]+)"\s*.*?"chapterNumber"\s*:\s*(\d+(?:\.\d+)?)', text):
-                        pass
                     # البحث عن روابط الفصول في البيانات
                     parsed = urlparse(series_url)
                     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -122,7 +120,20 @@ class AsuraProvider(BaseProvider):
                         num = float(m.group(2))
                         if not href.startswith('http'):
                             href = urljoin(base, href)
-                        chapters[num] = href
+                        # التحقق من أن الرابط ليس مجرد جزء من رابط آخر
+                        if "/chapter" in href.lower():
+                            chapters[num] = href
+
+                    # محاولة البحث عن slugs الفصول إذا لم نجد روابط كاملة
+                    if not chapters:
+                        for m in re.finditer(r'"slug"\s*:\s*"([^"]+)"\s*.*?"chapterNumber"\s*:\s*(\d+(?:\.\d+)?)', text):
+                            slug = m.group(1)
+                            num = float(m.group(2))
+                            if "/chapter/" not in slug:
+                                chapters[num] = f"{series_url.rstrip('/')}/{slug}"
+                            else:
+                                chapters[num] = urljoin(base, slug)
+
                     if chapters:
                         return chapters
                 except Exception:
@@ -132,28 +143,35 @@ class AsuraProvider(BaseProvider):
             parsed = urlparse(series_url)
             base = f"{parsed.scheme}://{parsed.netloc}"
 
-            selectors = [
-                'div.eph-num a',
-                'li.wp-manga-chapter a',
-                'a[href*="/chapter"]',
-                'a[href*="chapter-"]',
-            ]
-            for sel in selectors:
-                for a in soup.select(sel):
-                    href = a.get('href', '').strip()
-                    if not href:
-                        continue
-                    if not href.startswith('http'):
-                        href = urljoin(base, href)
-                    m = re.search(r'chapter[s]?[-/](\d+(?:\.\d+)?)', href, re.I)
-                    if not m:
-                        m = re.search(r'chapter[s]?[-/](\d+(?:\.\d+)?)', a.get_text(), re.I)
-                    if m:
-                        num = float(m.group(1))
-                        if num not in chapters:
-                            chapters[num] = href
-                if chapters:
-                    break
+            def _extract(h, b):
+                s = BeautifulSoup(h, 'html.parser')
+                res = {}
+                selectors = [
+                    'div.eph-num a',
+                    'li.wp-manga-chapter a',
+                    'a[href*="/chapter"]',
+                    'a[href*="chapter-"]',
+                ]
+                for sel in selectors:
+                    for a in s.select(sel):
+                        href = a.get('href', '').strip()
+                        if not href: continue
+                        if not href.startswith('http'):
+                            href = urljoin(base, href)
+                        m = re.search(r'chapter[s]?[-/](\d+(?:\.\d+)?)', href, re.I)
+                        if not m:
+                            m = re.search(r'chapter[s]?[-/](\d+(?:\.\d+)?)', a.get_text(), re.I)
+                        if m:
+                            num = float(m.group(1))
+                            if num not in res:
+                                res[num] = href
+                return res
+
+            chapters = _extract(html, series_url)
+
+            # محاولة جلب الصفحات الأخرى إذا كان هناك ترقيم صفحات
+            extra = self._paginate_chapters(series_url, _extract)
+            chapters.update(extra)
 
             return chapters
         except Exception as e:

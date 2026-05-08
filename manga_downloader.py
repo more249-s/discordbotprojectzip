@@ -76,10 +76,11 @@ class MangaDownloader:
                 print(f"Image {idx} failed: {e}")
             return None
 
-        sem = asyncio.Semaphore(8)
+        sem = asyncio.Semaphore(5) # تقليل العدد لتجنب حرق الموارد
 
         async def dl_limited(idx, u):
             async with sem:
+                await asyncio.sleep(0.1) # تأخير بسيط لتقليل الضغط
                 return await loop.run_in_executor(None, download_single, idx, u)
 
         tasks = [dl_limited(i, u) for i, u in enumerate(img_urls)]

@@ -215,14 +215,24 @@ async def remove_alert(alert_id, user_id):
 
 
 # ── User Permissions ──────────────────────────────────────────────────────
-async def get_user_rank(user_id: int) -> int:
+async def get_user_rank(user_id: int, auto_register: bool = False) -> int:
     """إرجاع رتبة المستخدم: 0 (لا يوجد) → 1 User → 2 VIP → 3 Owner"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT rank FROM user_permissions WHERE user_id = ?", (user_id,)
         ) as cursor:
             row = await cursor.fetchone()
-            return row[0] if row else 0
+            if row:
+                return row[0]
+
+            if auto_register:
+                await db.execute(
+                    "INSERT INTO user_permissions (user_id, rank, note) VALUES (?, ?, ?)",
+                    (user_id, 1, "Auto-registered")
+                )
+                await db.commit()
+                return 1
+            return 0
 
 
 async def set_user_rank(user_id: int, rank: int, note: str = ""):
