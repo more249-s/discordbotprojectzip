@@ -18,6 +18,7 @@ from gemini_client import GeminiClient
 from binance_client import BinanceMonitor
 from keep_alive import keep_alive
 from manga_downloader import MangaDownloader
+from providers.manager import ProviderManager
 
 # ── ألوان موحدة ───────────────────────────────────────────────────────────
 C_BLUE   = discord.Color.from_rgb(88, 101, 242)
@@ -36,6 +37,7 @@ bot          = commands.Bot(command_prefix="!", intents=intents)
 gemini       = GeminiClient()
 binance_mon  = BinanceMonitor(bot)
 downloader   = MangaDownloader()
+provider_mgr = ProviderManager()
 
 
 async def setup_hook():
@@ -432,6 +434,207 @@ async def clean_image_cmd(interaction: discord.Interaction, image: discord.Attac
             await interaction.followup.send(content=response.text)
     except Exception as e:
         await interaction.followup.send(f"❌ خطأ: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  أمر البحث عن المانجا
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="search", description="ابحث عن مانجا بالاسم")
+@app_commands.describe(query="اسم المانجا أو الكلمة المفتاحية")
+async def search_manga(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    results = await provider_mgr.search_manga(query, limit=8)
+    if not results:
+        return await interaction.followup.send(embed=discord.Embed(
+            title="🔍 لا نتائج",
+            description=f"لم يُعثر على نتائج لـ `{query}`.",
+            color=C_RED
+        ))
+
+    embed = discord.Embed(
+        title=f"🔍 نتائج البحث: {query}",
+        color=C_BLUE,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.set_footer(text="المصدر: MangaDex • Cat-Bi Manga Search")
+
+    view = discord.ui.View()
+    for i, r in enumerate(results[:8]):
+        status_icon = {"ongoing": "🟢", "completed": "✅", "hiatus": "🟡", "cancelled": "🔴"}.get(r["status"], "⚪")
+        desc_text   = r["description"][:120] + "..." if len(r["description"]) > 120 else r["description"]
+        embed.add_field(
+            name=f"{i+1}. {r['title']} {status_icon}",
+            value=f"{desc_text}\n[📖 اقرأ الآن]({r['url']})" if desc_text else f"[📖 اقرأ الآن]({r['url']})",
+            inline=False
+        )
+        if i < 5:
+            view.add_item(discord.ui.Button(
+                label=f"{i+1}. {r['title'][:40]}",
+                style=discord.ButtonStyle.link,
+                url=r["url"],
+                row=i // 2
+            ))
+
+    if results[0].get("cover"):
+        embed.set_thumbnail(url=results[0]["cover"])
+
+    await interaction.followup.send(embed=embed, view=view)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  أمر التحميل الجماعي (Batch)
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="batch", description="تحميل عدة فصول دفعة واحدة (مثال: 1-5 أو 1,3,5)")
+@app_commands.describe(
+    series_url="رابط صفحة المانجا الرئيسية",
+    chapters="نطاق الفصول: مثال 1-5 أو 1,3,7 أو 1-10",
+    title="اسم المانجا (اختياري)"
+)
+async def batch_download(interaction: discord.Interaction, series_url: str,
+                         chapters: str, title: str = "Manga"):
+    if not Config.is_allowed(interaction.user.id):
+        return await interaction.response.send_message("❌ هذا الأمر مخصص للمالك فقط.", ephemeral=True)
+
+    await interaction.response.defer()
+
+    # تحليل نطاق الفصول
+    chapter_nums = []
+    try:
+        if "-" in chapters and "," not in chapters:
+            parts = chapters.split("-")
+            start, end = int(parts[0].strip()), int(parts[1].strip())
+            chapter_nums = list(range(start, end + 1))
+        elif "," in chapters:
+            chapter_nums = [int(x.strip()) for x in chapters.split(",")]
+        else:
+            chapter_nums = [int(chapters.strip())]
+    except Exception:
+        return await interaction.followup.send(embed=discord.Embed(
+            title="❌ صيغة خاطئة",
+            description="استخدم: `1-5` أو `1,3,5` أو `7`",
+            color=C_RED
+        ))
+
+    if len(chapter_nums) > 20:
+        return await interaction.followup.send(embed=discord.Embed(
+            title="❌ عدد كبير جداً",
+            description="الحد الأقصى 20 فصل في المرة الواحدة.",
+            color=C_RED
+        ))
+
+    embed = discord.Embed(
+        title=f"📦 تحميل جماعي: {title}",
+        description=f"**الفصول المطلوبة:** `{chapters}`\n**العدد:** `{len(chapter_nums)}` فصل",
+        color=C_BLUE,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.add_field(name="⚙️ الحالة", value="🔍 جاري جلب قائمة الفصول...", inline=False)
+    embed.set_footer(text="Cat-Bi Batch Download")
+    msg = await interaction.followup.send(embed=embed)
+
+    # جلب كل الفصول
+    all_chapters = await provider_mgr.get_all_chapters(series_url)
+    if not all_chapters:
+        embed.color = C_RED
+        embed.set_field_at(0, name="❌ خطأ", value="فشل جلب قائمة الفصول. تأكد من الرابط.", inline=False)
+        return await msg.edit(embed=embed)
+
+    # تحديد الفصول المتاحة
+    available = {int(k): v for k, v in all_chapters.items() if int(k) in chapter_nums}
+    missing   = [n for n in chapter_nums if n not in available]
+
+    embed.set_field_at(0, name="⚙️ الحالة",
+        value=f"✅ وُجد `{len(available)}/{len(chapter_nums)}` فصل. بدء التحميل...", inline=False)
+    if missing:
+        embed.add_field(name="⚠️ غير متاح", value=f"الفصول: `{missing}`", inline=False)
+    await msg.edit(embed=embed)
+
+    # تحميل الفصول الواحدة تلو الأخرى
+    success, failed = [], []
+    for i, (ch_num, ch_url) in enumerate(sorted(available.items())):
+        ch_title = f"{title}_Ch{ch_num:03.0f}"
+        embed.set_field_at(0, name="⚙️ الحالة",
+            value=f"📥 تحميل الفصل `{ch_num}` ({i+1}/{len(available)})...", inline=False)
+        await msg.edit(embed=embed)
+        try:
+            final = await downloader.download_and_stitch(ch_url, ch_title)
+            if final and os.path.exists(final):
+                size_mb = os.path.getsize(final) / (1024 * 1024)
+                if size_mb <= 10.0:
+                    await interaction.followup.send(
+                        content=f"✅ فصل `{ch_num}` جاهز!",
+                        file=discord.File(final)
+                    )
+                else:
+                    link = await downloader.upload_to_gofile(final)
+                    if not link:
+                        link = await downloader.upload_to_catbox(final)
+                    if link:
+                        await interaction.followup.send(
+                            content=f"✅ فصل `{ch_num}` → [تحميل]({link})"
+                        )
+                    else:
+                        failed.append(ch_num)
+                        continue
+                downloader.cleanup(final)
+                success.append(ch_num)
+            else:
+                failed.append(ch_num)
+        except Exception as e:
+            failed.append(ch_num)
+            print(f"[Batch] Ch{ch_num} error: {e}")
+
+    # تقرير نهائي
+    embed.color  = C_GREEN if not failed else C_GOLD
+    embed.set_field_at(0, name="✅ اكتمل",
+        value=f"نجح: `{success}`\nفشل: `{failed}`" if failed else f"نجح جميع الفصول: `{success}`",
+        inline=False)
+    embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+    await msg.edit(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  أمر قائمة المزودات المدعومة
+# ─────────────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="providers", description="قائمة المواقع والمزودات المدعومة")
+async def list_providers(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed = discord.Embed(
+        title="🌐 المواقع المدعومة",
+        color=C_TEAL,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.add_field(name="📚 API رسمي / مخصص", inline=False, value=(
+        "• **MangaDex** — mangadex.org\n"
+        "• **Comick** — comick.fun / comick.io\n"
+        "• **MangaFire** — mangafire.to\n"
+        "• **MangaPlus** — mangaplus.shueisha.co.jp\n"
+        "• **Bato** — bato.to\n"
+        "• **Webtoons** — webtoons.com\n"
+        "• **Naver** — comic.naver.com\n"
+        "• **Manganato** — manganato + mangakakalot + ...\n"
+        "• **AsuraScans** — asurascans / asuratoon\n"
+        "• **WeebCentral** — weebcentral.com\n"
+        "• **TCBScans** — tcbscans.me\n"
+        "• **VortexScans** — vortexscans.com\n"
+        "• **MangaPill** — mangapill.com"
+    ))
+    embed.add_field(name="🇸🇦 المواقع العربية", inline=False, value=(
+        "• Mangalek • 3asq • Manga-ar\n"
+        "• Arabsama • Mangaae • Gmanga\n"
+        "• Ozulscans • Mangat • وغيرها..."
+    ))
+    embed.add_field(name="⚡ Madara WordPress (100+ موقع)", inline=False, value=(
+        "Flamescans • Reaperscans • Toonily • Zinmanga\n"
+        "Manhuaplus • Manhwaclan • Leviatanscans\n"
+        "Sushiscan • Nightscans • وأكثر من 100 موقع آخر..."
+    ))
+    embed.add_field(name="🤖 Generic + Gemini AI", inline=False, value=(
+        "أي موقع آخر → يحاول Generic أولاً\n"
+        "ثم Gemini AI كخط دفاع أخير!"
+    ))
+    embed.set_footer(text="Cat-Bi Manga System • يدعم أي رابط تقريباً!")
+    await interaction.followup.send(embed=embed)
 
 
 # ── مزامنة أوامر (أدمن) ──────────────────────────────────────────────────
