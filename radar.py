@@ -5,413 +5,503 @@ import asyncio
 import datetime
 import re
 import os
-from typing import Optional, List
+from typing import Optional
 import database
 from manga_downloader import MangaDownloader
 
-RADAR_CONCURRENT = 5
-CHAPTERS_PER_PAGE = 25
+RADAR_CONCURRENT  = 5
+CHAPTERS_PER_PAGE = 20          # فصول في كل صفحة (20 يعطي مساحة للـ embed)
 
-# ── ألوان موحدة للبانل ───────────────────────────────────────────────────────
-COLOR_IDLE    = discord.Color.from_rgb(88, 101, 242)   # بنفسجي Discord
-COLOR_RUNNING = discord.Color.from_rgb(255, 184, 0)    # ذهبي نشط
-COLOR_DONE    = discord.Color.from_rgb(87, 242, 135)   # أخضر نجاح
-COLOR_FAIL    = discord.Color.from_rgb(237, 66, 69)    # أحمر فشل
-COLOR_RADAR   = discord.Color.from_rgb(32, 178, 170)   # فيروزي للرادار
+# ── ألوان ─────────────────────────────────────────────────────────────────
+C_IDLE    = discord.Color.from_rgb(88,  101, 242)
+C_RUN     = discord.Color.from_rgb(255, 184,   0)
+C_DONE    = discord.Color.from_rgb(87,  242, 135)
+C_FAIL    = discord.Color.from_rgb(237,  66,  69)
+C_RADAR   = discord.Color.from_rgb(32,  178, 170)
+C_GREY    = discord.Color.greyple()
 
 
-def _chapter_label(num) -> str:
+# ── مساعدات ───────────────────────────────────────────────────────────────
+def _lbl(num) -> str:
     return str(int(num)) if float(num).is_integer() else str(num)
-
 
 def _series_name(url: str) -> str:
     parts = [p for p in url.rstrip("/").split("/") if p]
     return parts[-1].replace("-", " ").replace("_", " ").title() if parts else "Manga"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+#  Modal — اختيار نطاق الفصول
+# ─────────────────────────────────────────────────────────────────────────
+class RangeModal(ui.Modal, title="تحديد نطاق الفصول"):
+    """
+    المستخدم يكتب مثلاً:
+      150-200     → فصول من 150 إلى 200
+      1,5,10,50   → فصول محددة
+      latest:10   → آخر 10 فصول
+    """
+    range_input = ui.TextInput(
+        label="أدخل النطاق أو الفصول",
+        placeholder="مثال: 150-200  أو  1,5,10  أو  latest:10",
+        min_length=1,
+        max_length=100,
+    )
+
+    def __init__(self, panel: "MangaPanelView"):
+        super().__init__()
+        self.panel = panel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw   = self.range_input.value.strip()
+        nums  = set(self.panel.all_chapters)
+        sel   = set()
+
+        try:
+            # latest:N
+            if raw.lower().startswith("latest:"):
+                n = int(raw.split(":")[1])
+                sel = set(self.panel.all_chapters[:n])
+
+            # range  A-B
+            elif "-" in raw and "," not in raw:
+                parts = raw.split("-")
+                lo, hi = float(parts[0]), float(parts[1])
+                sel = {n for n in nums if lo <= n <= hi}
+
+            # قائمة مفصولة بفواصل
+            else:
+                for tok in raw.replace(" ", "").split(","):
+                    try:
+                        sel.add(float(tok))
+                    except ValueError:
+                        pass
+                sel &= nums          # احتفظ فقط بما يوجد فعلاً
+        except Exception:
+            pass
+
+        if not sel:
+            await interaction.response.send_message(
+                "❌ لم يُعثر على فصول بهذا النطاق، تأكد من الصيغة.", ephemeral=True
+            )
+            return
+
+        # دمج مع الاختيار الحالي
+        existing = set(self.panel.selected)
+        existing.update(sel)
+        self.panel.selected = sorted(existing, reverse=True)
+        self.panel._rebuild()
+        await interaction.response.edit_message(
+            embed=self.panel.build_embed(f"✅ تم إضافة {len(sel)} فصل من النطاق."),
+            view=self.panel
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #  MangaPanelView — اللوحة الرئيسية
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 class MangaPanelView(ui.View):
-    """لوحة تحكم احترافية لتحميل فصول المانجا مع تقليب الصفحات."""
 
-    def __init__(self, bot, downloader, provider_manager, series_url, chapters_dict, requester: discord.User = None):
-        super().__init__(timeout=1200)
-        self.bot             = bot
-        self.downloader      = downloader
+    def __init__(self, bot, downloader, provider_manager,
+                 series_url, chapters_dict,
+                 requester: discord.User = None):
+        super().__init__(timeout=1800)
+        self.bot              = bot
+        self.downloader       = downloader
         self.provider_manager = provider_manager
-        self.series_url      = series_url
-        self.requester       = requester          # المستخدم الذي طلب اللوحة
+        self.series_url       = series_url
+        self.requester        = requester
 
-        # كل الفصول مرتبة تنازلياً (الأحدث أولاً)
-        self.all_chapters    = sorted(chapters_dict.keys(), reverse=True)
-        self.chapters_dict   = chapters_dict
+        # ترتيب تنازلي (الأحدث أولاً)
+        self.all_chapters  : list[float] = sorted(chapters_dict.keys(), reverse=True)
+        self.chapters_dict = chapters_dict
 
-        self.page_index      = 0                  # الصفحة الحالية
-        self.selected        : list[float] = []   # الفصول المحددة
-        self.chapter_status  : dict       = {}    # حالة كل فصل
-        self.running         = False
+        self.page          = 0
+        self.selected      : list[float] = []
+        self.ch_status     : dict        = {}
+        self.running       = False
 
-        self._rebuild_menu()
+        self._rebuild()
 
-    # ── مساعدات الصفحات ───────────────────────────────────────────────────
+    # ── صفحات ─────────────────────────────────────────────────────────────
     @property
     def total_pages(self) -> int:
         return max(1, (len(self.all_chapters) + CHAPTERS_PER_PAGE - 1) // CHAPTERS_PER_PAGE)
 
     @property
-    def page_chapters(self) -> list[float]:
-        start = self.page_index * CHAPTERS_PER_PAGE
-        return self.all_chapters[start: start + CHAPTERS_PER_PAGE]
+    def page_chs(self) -> list[float]:
+        s = self.page * CHAPTERS_PER_PAGE
+        return self.all_chapters[s: s + CHAPTERS_PER_PAGE]
 
-    # ── بناء قائمة الاختيار ────────────────────────────────────────────────
-    def _rebuild_menu(self):
-        """إزالة القائمة القديمة وإعادة بنائها بالصفحة الحالية."""
-        # أزل كل العناصر ثم أضف القائمة والأزرار
+    # ── بناء كل العناصر ───────────────────────────────────────────────────
+    def _rebuild(self):
         self.clear_items()
 
-        opts = [
-            discord.SelectOption(
-                label=f"الفصل {_chapter_label(n)}",
-                value=str(n),
-                emoji="✅" if n in self.selected else "🔲",
-                description=f"{'محدد' if n in self.selected else 'اضغط للتحديد'}",
-                default=(n in self.selected),
+        chs   = self.page_chs
+        sel_s = set(self.selected)
+
+        # ── صف 0: قائمة الاختيار ─────────────────────────────────────────
+        if chs:
+            opts = [
+                discord.SelectOption(
+                    label=f"Ch.{_lbl(n)}",
+                    value=str(n),
+                    emoji="✅" if n in sel_s else "🔲",
+                    description="محدد" if n in sel_s else "اضغط للإضافة",
+                    default=(n in sel_s),
+                )
+                for n in chs
+            ]
+            sel = ui.Select(
+                placeholder=f"📖  صفحة {self.page+1}/{self.total_pages}  —  اختر فصولاً",
+                min_values=1,
+                max_values=len(opts),
+                options=opts,
+                row=0,
+                disabled=self.running,
             )
-            for n in self.page_chapters
-        ]
-        self.select_menu = ui.Select(
-            placeholder=f"📖 اختر فصولاً — صفحة {self.page_index+1}/{self.total_pages}",
-            min_values=1,
-            max_values=len(opts),
-            options=opts,
-        )
-        self.select_menu.callback = self.select_callback
-        self.add_item(self.select_menu)
+            sel.callback = self._cb_select
+            self.add_item(sel)
 
-        # صف أزرار التنقل
-        self.add_item(self._btn_prev())
-        self.add_item(self._btn_page_info())
-        self.add_item(self._btn_next())
+        # ── صف 1: تنقل الصفحات ───────────────────────────────────────────
+        nav_dis = self.running
 
-        # صف أزرار التحديد السريع
-        self.add_item(self._btn_latest_one())
-        self.add_item(self._btn_latest_five())
-        self.add_item(self._btn_all_page())
-        self.add_item(self._btn_clear())
+        # ⏮ أول صفحة
+        btn_first = ui.Button(emoji="⏮️", style=discord.ButtonStyle.secondary,
+                              row=1, disabled=(self.page == 0 or nav_dis),
+                              custom_id="nav_first")
+        btn_first.callback = self._cb_first
+        self.add_item(btn_first)
 
-        # صف أزرار التحكم
-        self.add_item(self._btn_start())
-        self.add_item(self._btn_cancel())
+        # ◀ سابق
+        btn_prev = ui.Button(emoji="◀️", style=discord.ButtonStyle.secondary,
+                             row=1, disabled=(self.page == 0 or nav_dis),
+                             custom_id="nav_prev")
+        btn_prev.callback = self._cb_prev
+        self.add_item(btn_prev)
 
-    # ── مصانع الأزرار (ديناميكية) ─────────────────────────────────────────
-    def _btn_prev(self):
-        btn = ui.Button(
-            emoji="◀️", style=discord.ButtonStyle.secondary,
-            disabled=(self.page_index == 0 or self.running),
-            custom_id="btn_prev", row=1
-        )
-        btn.callback = self.cb_prev
-        return btn
-
-    def _btn_next(self):
-        btn = ui.Button(
-            emoji="▶️", style=discord.ButtonStyle.secondary,
-            disabled=(self.page_index >= self.total_pages - 1 or self.running),
-            custom_id="btn_next", row=1
-        )
-        btn.callback = self.cb_next
-        return btn
-
-    def _btn_page_info(self):
-        btn = ui.Button(
-            label=f"{self.page_index + 1} / {self.total_pages}",
+        # [n/total] — مؤشر مُعطَّل
+        self.add_item(ui.Button(
+            label=f"{self.page+1} / {self.total_pages}",
             style=discord.ButtonStyle.secondary,
-            disabled=True, custom_id="btn_page_info", row=1
-        )
-        return btn
+            row=1, disabled=True, custom_id="nav_info"
+        ))
 
-    def _btn_latest_one(self):
-        btn = ui.Button(label="⭐ آخر فصل", style=discord.ButtonStyle.primary, custom_id="btn_l1", row=2, disabled=self.running)
-        btn.callback = self.cb_latest_one
-        return btn
+        # ▶ تالي
+        btn_next = ui.Button(emoji="▶️", style=discord.ButtonStyle.secondary,
+                             row=1, disabled=(self.page >= self.total_pages - 1 or nav_dis),
+                             custom_id="nav_next")
+        btn_next.callback = self._cb_next
+        self.add_item(btn_next)
 
-    def _btn_latest_five(self):
-        btn = ui.Button(label="📦 آخر 5", style=discord.ButtonStyle.secondary, custom_id="btn_l5", row=2, disabled=self.running)
-        btn.callback = self.cb_latest_five
-        return btn
+        # ⏭ آخر صفحة
+        btn_last = ui.Button(emoji="⏭️", style=discord.ButtonStyle.secondary,
+                             row=1, disabled=(self.page >= self.total_pages - 1 or nav_dis),
+                             custom_id="nav_last")
+        btn_last.callback = self._cb_last
+        self.add_item(btn_last)
 
-    def _btn_all_page(self):
-        btn = ui.Button(label="📄 هذه الصفحة", style=discord.ButtonStyle.secondary, custom_id="btn_page_all", row=2, disabled=self.running)
-        btn.callback = self.cb_all_page
-        return btn
+        # ── صف 2: اختيار سريع ────────────────────────────────────────────
+        b_l1 = ui.Button(label="⭐ آخر فصل", style=discord.ButtonStyle.primary,
+                         row=2, disabled=self.running, custom_id="qs_l1")
+        b_l1.callback = self._cb_l1
+        self.add_item(b_l1)
 
-    def _btn_clear(self):
-        btn = ui.Button(label="🧹 مسح", style=discord.ButtonStyle.danger, custom_id="btn_clear", row=2, disabled=self.running)
-        btn.callback = self.cb_clear
-        return btn
+        b_l5 = ui.Button(label="📦 آخر 5", style=discord.ButtonStyle.secondary,
+                         row=2, disabled=self.running, custom_id="qs_l5")
+        b_l5.callback = self._cb_l5
+        self.add_item(b_l5)
 
-    def _btn_start(self):
-        btn = ui.Button(label="🚀 ابدأ التحميل", style=discord.ButtonStyle.success, custom_id="btn_start", row=3, disabled=self.running)
-        btn.callback = self.cb_start
-        return btn
+        b_pg = ui.Button(label="📄 الصفحة", style=discord.ButtonStyle.secondary,
+                         row=2, disabled=self.running, custom_id="qs_pg")
+        b_pg.callback = self._cb_page_all
+        self.add_item(b_pg)
 
-    def _btn_cancel(self):
-        btn = ui.Button(label="✖ إغلاق", style=discord.ButtonStyle.danger, custom_id="btn_cancel", row=3, disabled=self.running)
-        btn.callback = self.cb_cancel
-        return btn
+        b_rng = ui.Button(label="✏️ نطاق", style=discord.ButtonStyle.secondary,
+                          row=2, disabled=self.running, custom_id="qs_range")
+        b_rng.callback = self._cb_range
+        self.add_item(b_rng)
+
+        b_clr = ui.Button(label="🧹 مسح", style=discord.ButtonStyle.danger,
+                          row=2, disabled=self.running, custom_id="qs_clr")
+        b_clr.callback = self._cb_clear
+        self.add_item(b_clr)
+
+        # ── صف 3: تحكم ───────────────────────────────────────────────────
+        b_start = ui.Button(label="🚀  ابدأ التحميل", style=discord.ButtonStyle.success,
+                            row=3, disabled=self.running, custom_id="ctrl_start")
+        b_start.callback = self._cb_start
+        self.add_item(b_start)
+
+        b_close = ui.Button(label="✖  إغلاق", style=discord.ButtonStyle.danger,
+                            row=3, disabled=self.running, custom_id="ctrl_close")
+        b_close.callback = self._cb_close
+        self.add_item(b_close)
 
     # ── بناء الـ Embed ─────────────────────────────────────────────────────
     def build_embed(self, note: str = None, color=None) -> discord.Embed:
-        if color is None:
-            color = COLOR_RUNNING if self.running else COLOR_IDLE
+        color = color or (C_RUN if self.running else C_IDLE)
 
-        title = f"{'⚙️ جاري التحميل...' if self.running else '📚'} لوحة تحكم المانجا"
         series = _series_name(self.series_url)
+        title  = ("⚙️  جاري التحميل..." if self.running else "📚  لوحة تحكم المانجا")
+        sel_s  = set(self.selected)
 
-        embed = discord.Embed(title=title, color=color, timestamp=datetime.datetime.now(datetime.timezone.utc))
-        embed.description = (
-            f"**العمل:** `{series}`\n"
-            f"**إجمالي الفصول:** `{len(self.all_chapters)}`\n"
-            f"**المحدد حالياً:** `{len(self.selected)}`\n"
-            f"**الصفحة:** `{self.page_index+1} / {self.total_pages}`"
+        em = discord.Embed(title=title, color=color,
+                           timestamp=datetime.datetime.now(datetime.timezone.utc))
+
+        # ── معلومات العمل
+        em.description = (
+            f"**📖 العمل:** `{series}`\n"
+            f"**📊 إجمالي:** `{len(self.all_chapters)}` فصل  ·  "
+            f"**☑️ محدد:** `{len(self.selected)}`  ·  "
+            f"**📄 صفحة:** `{self.page+1}/{self.total_pages}`"
         )
 
-        # ── قائمة الفصول المحددة مع حالاتها
-        if self.selected:
+        # ── قائمة فصول الصفحة الحالية (مرئية دائماً)
+        chs = self.page_chs
+        if chs:
             lines = []
-            for num in sorted(self.selected):
-                s = self.chapter_status.get(num, {"state": "selected"})
-                state = s.get("state", "selected")
-                pct   = s.get("progress", 0)
-                prov  = s.get("provider", "")
-                link  = s.get("link", "")
-                lbl   = _chapter_label(num)
+            for n in chs:
+                st    = self.ch_status.get(n, {})
+                state = st.get("state", "")
+                pct   = st.get("progress", 0)
+                prov  = st.get("provider", "")
+                link  = st.get("link", "")
+                lbl   = _lbl(n)
 
                 if state == "queued":
-                    icon = "⏸️"
-                    detail = "في الانتظار"
+                    tick = "⏸️"; info = "في الانتظار"
                 elif state == "downloading":
-                    icon = "📥"
-                    detail = f"تحميل `{pct}%`"
+                    tick = "📥"; info = f"تحميل {pct}%"
                 elif state == "stitching":
-                    icon = "🧵"
-                    detail = "دمج SmartStitch"
+                    tick = "🧵"; info = "دمج SmartStitch"
                 elif state == "uploading":
-                    icon = "☁️"
-                    detail = f"رفع {prov} `{pct}%`"
+                    tick = "☁️"; info = f"رفع {prov} {pct}%"
                 elif state == "done":
-                    icon = "✅"
-                    detail = f"[تحميل — {prov}]({link})" if link else f"جاهز عبر {prov}"
+                    tick = "✅"; info = f"[{prov}]({link})" if link else f"جاهز"
                 elif state == "failed":
-                    icon = "❌"
-                    detail = s.get("detail", "فشل")[:50]
+                    tick = "❌"; info = st.get("detail", "فشل")[:40]
+                elif n in sel_s:
+                    tick = "🔵"; info = "محدد"
                 else:
-                    icon = "🔲"
-                    detail = "محدد"
+                    tick = "▫️"; info = ""
 
-                lines.append(f"{icon} **الفصل {lbl}** — {detail}")
+                line = f"{tick} `Ch.{lbl}`"
+                if info:
+                    line += f"  —  {info}"
+                lines.append(line)
 
-            # تقسيم إذا كانت القائمة طويلة
-            chunk = lines[:15]
-            if len(lines) > 15:
-                chunk.append(f"… و `{len(lines)-15}` فصل إضافي")
-            embed.add_field(name="📋 قائمة التنفيذ", value="\n".join(chunk), inline=False)
+            # أعمدتان إذا كانت الصفحة كاملة
+            half = len(lines) // 2
+            if len(lines) > 10 and not self.running:
+                col_a = "\n".join(lines[:half])
+                col_b = "\n".join(lines[half:])
+                em.add_field(name=f"📋 الفصول (صفحة {self.page+1})", value=col_a, inline=True)
+                em.add_field(name="​", value=col_b, inline=True)
+            else:
+                em.add_field(name=f"📋 الفصول (صفحة {self.page+1})", value="\n".join(lines), inline=False)
 
-        # روابط جاهزة
+        # ── روابط جاهزة
         ready = [
-            f"[الفصل {_chapter_label(n)}]({self.chapter_status[n]['link']})"
+            f"[Ch.{_lbl(n)}]({self.ch_status[n]['link']})"
             for n in sorted(self.selected)
-            if self.chapter_status.get(n, {}).get("state") == "done" and self.chapter_status[n].get("link")
+            if self.ch_status.get(n, {}).get("state") == "done"
+            and self.ch_status[n].get("link")
         ]
         if ready:
-            embed.add_field(name="🔗 روابط جاهزة", value="  ·  ".join(ready[:10]), inline=False)
+            em.add_field(name="🔗 روابط جاهزة", value="  ·  ".join(ready[:12]), inline=False)
 
         if note:
-            embed.add_field(name="💬 آخر تحديث", value=note, inline=False)
+            em.add_field(name="💬", value=note, inline=False)
 
-        embed.set_footer(
-            text=f"Cat-Bi • Google Drive أولاً ثم Gofile • صفحة {self.page_index+1}/{self.total_pages}",
-            icon_url="https://i.imgur.com/wXpPqgr.png"
+        em.set_footer(text=f"Cat-Bi  •  Drive → Gofile → Catbox  •  صفحة {self.page+1}/{self.total_pages}")
+        return em
+
+    # ── callbacks التنقل ──────────────────────────────────────────────────
+    async def _cb_select(self, interaction: discord.Interaction):
+        sel     = interaction.data["values"]
+        chosen  = {float(v) for v in sel}
+        page_s  = set(self.page_chs)
+        others  = {n for n in self.selected if n not in page_s}
+        self.selected = sorted(others | chosen, reverse=True)
+        self._rebuild()
+        await interaction.response.edit_message(
+            embed=self.build_embed(f"☑️ المحدد الآن: {len(self.selected)} فصل"), view=self
         )
-        return embed
 
-    # ── ردود فعل الأزرار ──────────────────────────────────────────────────
-    async def select_callback(self, interaction: discord.Interaction):
-        chosen = [float(v) for v in self.select_menu.values]
-        # دمج مع المحدد من صفحات أخرى
-        page_set = set(self.page_chapters)
-        others   = [n for n in self.selected if n not in page_set]
-        self.selected = sorted(set(others + chosen), reverse=True)
-        self._rebuild_menu()
-        await interaction.response.edit_message(embed=self.build_embed(f"تم تحديث الاختيار: {len(self.selected)} فصل"), view=self)
-
-    async def cb_prev(self, interaction: discord.Interaction):
-        if self.page_index > 0:
-            self.page_index -= 1
-        self._rebuild_menu()
+    async def _cb_first(self, interaction: discord.Interaction):
+        self.page = 0; self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    async def cb_next(self, interaction: discord.Interaction):
-        if self.page_index < self.total_pages - 1:
-            self.page_index += 1
-        self._rebuild_menu()
+    async def _cb_prev(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1); self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    async def cb_latest_one(self, interaction: discord.Interaction):
-        self.selected = self.all_chapters[:1]
-        self._rebuild_menu()
+    async def _cb_next(self, interaction: discord.Interaction):
+        self.page = min(self.total_pages - 1, self.page + 1); self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _cb_last(self, interaction: discord.Interaction):
+        self.page = self.total_pages - 1; self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    # ── callbacks اختيار سريع ────────────────────────────────────────────
+    async def _cb_l1(self, interaction: discord.Interaction):
+        self.selected = self.all_chapters[:1]; self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed("تم اختيار آخر فصل."), view=self)
 
-    async def cb_latest_five(self, interaction: discord.Interaction):
-        self.selected = self.all_chapters[:5]
-        self._rebuild_menu()
+    async def _cb_l5(self, interaction: discord.Interaction):
+        self.selected = self.all_chapters[:5]; self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed("تم اختيار آخر 5 فصول."), view=self)
 
-    async def cb_all_page(self, interaction: discord.Interaction):
-        page_set = set(self.page_chapters)
-        others   = [n for n in self.selected if n not in page_set]
-        self.selected = sorted(set(others + self.page_chapters), reverse=True)
-        self._rebuild_menu()
-        await interaction.response.edit_message(embed=self.build_embed(f"تم اختيار كل فصول الصفحة ({len(self.page_chapters)})."), view=self)
+    async def _cb_page_all(self, interaction: discord.Interaction):
+        pg  = set(self.page_chs)
+        oth = {n for n in self.selected if n not in pg}
+        self.selected = sorted(oth | pg, reverse=True); self._rebuild()
+        await interaction.response.edit_message(
+            embed=self.build_embed(f"تم تحديد كل فصول الصفحة ({len(self.page_chs)})."), view=self
+        )
 
-    async def cb_clear(self, interaction: discord.Interaction):
-        self.selected      = []
-        self.chapter_status = {}
-        self._rebuild_menu()
+    async def _cb_range(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(RangeModal(self))
+
+    async def _cb_clear(self, interaction: discord.Interaction):
+        self.selected = []; self.ch_status = {}; self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed("تم مسح جميع الاختيارات."), view=self)
 
-    async def cb_cancel(self, interaction: discord.Interaction):
+    async def _cb_close(self, interaction: discord.Interaction):
         for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(embed=self.build_embed("🔒 تم إغلاق اللوحة.", color=discord.Color.greyple()), view=self)
+        await interaction.response.edit_message(
+            embed=self.build_embed("🔒 تم إغلاق اللوحة.", color=C_GREY), view=self
+        )
         self.stop()
 
-    async def cb_start(self, interaction: discord.Interaction):
+    # ── callback بدء التحميل ──────────────────────────────────────────────
+    async def _cb_start(self, interaction: discord.Interaction):
         if self.running:
-            await interaction.response.send_message("⚠️ عملية جارية بالفعل.", ephemeral=True)
-            return
+            return await interaction.response.send_message("⚠️ عملية جارية.", ephemeral=True)
         if not self.selected:
-            await interaction.response.send_message("❗ اختر فصلاً واحداً على الأقل أولاً.", ephemeral=True)
-            return
+            return await interaction.response.send_message(
+                "❗ اختر فصلاً واحداً على الأقل.\nاستخدم القائمة أو أزرار الاختيار السريع أو زر ✏️ نطاق.",
+                ephemeral=True
+            )
 
-        self.running = True
-        to_download  = sorted(self.selected)
-        self.chapter_status = {n: {"state": "queued"} for n in to_download}
-        self._rebuild_menu()
-
+        self.running     = True
+        to_dl            = sorted(self.selected)
+        self.ch_status   = {n: {"state": "queued"} for n in to_dl}
+        self._rebuild()
         await interaction.response.edit_message(
-            embed=self.build_embed("🚀 بدأت قائمة التنفيذ...", color=COLOR_RUNNING),
-            view=self
+            embed=self.build_embed("🚀 بدأت قائمة التنفيذ...", color=C_RUN), view=self
         )
         panel_msg = interaction.message
 
-        # ──── حلقة التحميل ────────────────────────────────────────────────
-        for num in to_download:
+        for num in to_dl:
             url   = self.chapters_dict[num]
-            lbl   = _chapter_label(num)
+            lbl   = _lbl(num)
             title = f"Ch_{lbl}"
-
-            self.chapter_status[num] = {"state": "downloading", "progress": 0}
+            self.ch_status[num] = {"state": "downloading", "progress": 0}
             last_edit = 0.0
 
-            async def progress_cb(curr, tot, txt, _num=num, _lbl=lbl):
+            async def pcb(cur, tot, txt, _n=num, _l=lbl):
                 nonlocal last_edit
-                pct   = min(100, int(curr * 100 / max(tot, 1)))
-                state = "stitching" if any(k in txt for k in ("SmartStitch", "دمج", "🪡")) else "downloading"
+                pct   = min(100, int(cur * 100 / max(tot, 1)))
+                state = "downloading"
+                if any(k in txt for k in ("SmartStitch", "دمج", "🪡")):
+                    state = "stitching"
                 if "رفع" in txt or "☁️" in txt:
                     state = "uploading"
-                prov = "Drive" if "Drive" in txt else ("Gofile" if "Gofile" in txt else "")
-                self.chapter_status[_num].update({"state": state, "progress": pct, "provider": prov, "detail": txt})
+                prov = ("Drive" if "Drive" in txt
+                        else "Gofile" if "Gofile" in txt
+                        else "Catbox" if "Catbox" in txt else "")
+                self.ch_status[_n].update({"state": state, "progress": pct, "provider": prov})
                 now = asyncio.get_running_loop().time()
-                if now - last_edit < 1.5 and pct < 100:
+                if now - last_edit < 1.8 and pct < 100:
                     return
                 last_edit = now
                 try:
-                    await panel_msg.edit(embed=self.build_embed(f"الفصل {_lbl}: {txt} ({pct}%)"))
+                    await panel_msg.edit(embed=self.build_embed(f"{_l}: {txt} ({pct}%)"))
                 except Exception:
                     pass
 
-            file_path = None
+            fp = None
             try:
-                file_path = await self.downloader.download_and_stitch(url, title, progress_callback=progress_cb)
-                if not file_path:
-                    self.chapter_status[num] = {"state": "failed", "detail": "فشل التحميل"}
-                    await panel_msg.edit(embed=self.build_embed(f"❌ الفصل {lbl}: فشل التحميل."))
+                fp = await self.downloader.download_and_stitch(url, title, progress_callback=pcb)
+                if not fp:
+                    self.ch_status[num] = {"state": "failed", "detail": "فشل التحميل"}
+                    await panel_msg.edit(embed=self.build_embed(f"❌ Ch.{lbl}: فشل التحميل."))
                     continue
 
-                # ── رفع Drive أولاً ────────────────────────────────────────
-                self.chapter_status[num] = {"state": "uploading", "progress": 0, "provider": "Drive"}
-                await panel_msg.edit(embed=self.build_embed(f"☁️ الفصل {lbl}: رفع إلى Google Drive..."))
-                link     = await self.downloader.upload_to_gdrive(file_path, os.path.basename(file_path), progress_callback=progress_cb)
-                provider = "Google Drive"
-
-                if not link:
-                    self.chapter_status[num] = {"state": "uploading", "progress": 0, "provider": "Gofile"}
-                    await panel_msg.edit(embed=self.build_embed(f"☁️ الفصل {lbl}: Drive فشل، جاري Gofile..."))
-                    link     = await self.downloader.upload_to_gofile(file_path, progress_callback=progress_cb)
-                    provider = "Gofile"
-
-                if not link:
-                    self.chapter_status[num] = {"state": "uploading", "progress": 0, "provider": "Catbox"}
-                    await panel_msg.edit(embed=self.build_embed(f"☁️ الفصل {lbl}: Gofile فشل، جاري Catbox..."))
-                    link     = await self.downloader.upload_to_catbox(file_path, progress_callback=progress_cb)
-                    provider = "Catbox"
+                link = prov = None
+                for pname, pfn in [
+                    ("Drive",  lambda f: self.downloader.upload_to_gdrive(f, os.path.basename(f), progress_callback=pcb)),
+                    ("Gofile", lambda f: self.downloader.upload_to_gofile(f, progress_callback=pcb)),
+                    ("Catbox", lambda f: self.downloader.upload_to_catbox(f, progress_callback=pcb)),
+                ]:
+                    self.ch_status[num].update({"state": "uploading", "provider": pname, "progress": 0})
+                    await panel_msg.edit(embed=self.build_embed(f"☁️ Ch.{lbl}: رفع → {pname}..."))
+                    link = await pfn(fp)
+                    if link:
+                        prov = pname
+                        break
 
                 if link:
-                    self.chapter_status[num] = {"state": "done", "progress": 100, "provider": provider, "link": link}
-                    await panel_msg.edit(embed=self.build_embed(f"✅ الفصل {lbl}: اكتمل عبر {provider}.", color=COLOR_DONE))
-                    # ── منشن المستخدم ─────────────────────────────────────
+                    self.ch_status[num] = {"state": "done", "progress": 100,
+                                           "provider": prov, "link": link}
+                    await panel_msg.edit(embed=self.build_embed(
+                        f"✅ Ch.{lbl} جاهز عبر {prov}!", color=C_DONE
+                    ))
+                    # ── منشن المستخدم
                     mention = self.requester.mention if self.requester else ""
-                    notify_embed = discord.Embed(
-                        title=f"✅ الفصل {lbl} جاهز!",
+                    notify  = discord.Embed(
+                        title=f"✅  Ch.{lbl} جاهز!",
                         description=(
                             f"**العمل:** `{_series_name(self.series_url)}`\n"
-                            f"**المزود:** {provider}\n"
-                            f"[📥 اضغط هنا للتحميل]({link})"
+                            f"**المزود:** {prov}\n"
+                            f"[📥  اضغط هنا للتحميل]({link})"
                         ),
-                        color=COLOR_DONE,
+                        color=C_DONE,
                         timestamp=datetime.datetime.now(datetime.timezone.utc)
                     )
-                    notify_embed.set_footer(text="Cat-Bi Manga System")
-                    await panel_msg.channel.send(content=mention, embed=notify_embed)
+                    notify.set_footer(text="Cat-Bi Manga System")
+                    await panel_msg.channel.send(content=mention, embed=notify)
                 else:
-                    self.chapter_status[num] = {"state": "failed", "detail": "فشل الرفع على كلا الخدمتين"}
-                    await panel_msg.edit(embed=self.build_embed(f"❌ الفصل {lbl}: فشل الرفع.", color=COLOR_FAIL))
+                    self.ch_status[num] = {"state": "failed",
+                                           "detail": "فشل الرفع (Drive/Gofile/Catbox)"}
+                    await panel_msg.edit(embed=self.build_embed(f"❌ Ch.{lbl}: فشل الرفع.", color=C_FAIL))
 
             except Exception as e:
-                self.chapter_status[num] = {"state": "failed", "detail": str(e)[:80]}
-                await panel_msg.edit(embed=self.build_embed(f"❌ الفصل {lbl}: خطأ — {str(e)[:60]}", color=COLOR_FAIL))
+                self.ch_status[num] = {"state": "failed", "detail": str(e)[:80]}
+                await panel_msg.edit(embed=self.build_embed(f"❌ Ch.{lbl}: خطأ.", color=C_FAIL))
             finally:
-                if file_path:
-                    self.downloader.cleanup(file_path)
+                if fp:
+                    self.downloader.cleanup(fp)
             await asyncio.sleep(0.5)
 
-        # ── انتهاء التحميل ─────────────────────────────────────────────────
         self.running = False
-        done_count   = sum(1 for s in self.chapter_status.values() if s.get("state") == "done")
-        fail_count   = sum(1 for s in self.chapter_status.values() if s.get("state") == "failed")
-        final_color  = COLOR_DONE if fail_count == 0 else (COLOR_FAIL if done_count == 0 else COLOR_RUNNING)
-
-        self._rebuild_menu()
-        summary = f"🏁 انتهت العملية — ✅ {done_count} نجح، ❌ {fail_count} فشل."
-        await panel_msg.edit(embed=self.build_embed(summary, color=final_color), view=self)
+        done_n = sum(1 for s in self.ch_status.values() if s.get("state") == "done")
+        fail_n = sum(1 for s in self.ch_status.values() if s.get("state") == "failed")
+        fc     = C_DONE if fail_n == 0 else (C_FAIL if done_n == 0 else C_RUN)
+        self._rebuild()
+        await panel_msg.edit(
+            embed=self.build_embed(f"🏁 انتهت — ✅ {done_n} نجح، ❌ {fail_n} فشل.", color=fc),
+            view=self
+        )
         self.stop()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 def is_admin():
-    async def predicate(interaction: discord.Interaction):
-        return interaction.user.guild_permissions.administrator
+    async def predicate(i: discord.Interaction):
+        return i.user.guild_permissions.administrator
     return app_commands.check(predicate)
 
 
 from providers.manager import ProviderManager
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 #  RadarCog
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 class RadarCog(commands.Cog):
     def __init__(self, bot):
         self.bot              = bot
@@ -422,14 +512,14 @@ class RadarCog(commands.Cog):
     def cog_unload(self):
         self.chapter_radar_loop.cancel()
 
-    # ── فحص الرادار ───────────────────────────────────────────────────────
-    async def fetch_latest_chapter(self, url: str, current_ch: float) -> Optional[float]:
+    # ── رادار الفصول ─────────────────────────────────────────────────────
+    async def fetch_latest(self, url: str, cur: float) -> Optional[float]:
         try:
             latest = await self.provider_manager.get_latest_chapter(url)
-            if latest and latest > current_ch and latest <= current_ch + 15:
+            if latest and latest > cur and latest <= cur + 15:
                 return latest
         except Exception as e:
-            print(f"[Radar] Provider error for {url}: {e}")
+            print(f"[Radar] {url}: {e}")
         return None
 
     @tasks.loop(minutes=30)
@@ -442,10 +532,10 @@ class RadarCog(commands.Cog):
 
         due = []
         for row in trackers:
-            tracker_id, guild_id, channel_id, url, last_chapter, custom_msg, interval_hours, last_checked_str, download_enabled = row
+            tid, gid, cid, url, last_ch, msg, interval, last_str, dl_en = row
             try:
-                last_checked = datetime.datetime.fromisoformat(last_checked_str)
-                if (now - last_checked) >= datetime.timedelta(hours=interval_hours):
+                last = datetime.datetime.fromisoformat(last_str)
+                if (now - last) >= datetime.timedelta(hours=interval):
                     due.append(row)
             except Exception:
                 due.append(row)
@@ -453,308 +543,282 @@ class RadarCog(commands.Cog):
         if not due:
             return
 
-        print(f"--- [الرادار] فحص {len(due)} من أصل {len(trackers)} ---")
+        print(f"[Radar] فحص {len(due)}/{len(trackers)}")
         sem = asyncio.Semaphore(RADAR_CONCURRENT)
 
         async def check_one(row):
-            tracker_id, guild_id, channel_id, url, last_chapter, custom_msg, interval_hours, _, download_enabled = row
+            tid, gid, cid, url, last_ch, msg, interval, _, dl_en = row
             async with sem:
                 try:
-                    print(f"🔍 [الرادار] {url}")
-                    latest = await self.fetch_latest_chapter(url, last_chapter)
-                    if latest and latest > last_chapter:
-                        print(f"✅ فصل جديد: {latest} (القديم: {last_chapter})")
+                    latest = await self.fetch_latest(url, last_ch)
+                    if not (latest and latest > last_ch):
+                        await database.update_tracker_time(tid, now.isoformat())
+                        return
 
-                        download_link = None
-                        if download_enabled:
-                            chapter_url = self._build_chapter_url(url, latest)
-                            ch_title    = f"Ch_{latest}_{url.rstrip('/').split('/')[-1]}"
-                            zip_path    = await self.downloader.download_and_stitch(chapter_url, ch_title)
-                            if zip_path:
-                                download_link = await self.downloader.upload_to_gdrive(zip_path, os.path.basename(zip_path))
-                                if not download_link:
-                                    download_link = await self.downloader.upload_to_gofile(zip_path)
-                                if not download_link:
-                                    download_link = await self.downloader.upload_to_catbox(zip_path)
-                                self.downloader.cleanup(zip_path)
+                    print(f"[Radar] ✅ فصل جديد {latest} لـ {url}")
+                    dl_link = None
+                    if dl_en:
+                        ch_url = self._build_ch_url(url, latest)
+                        ch_ttl = f"Ch_{latest}_{url.rstrip('/').split('/')[-1]}"
+                        zp     = await self.downloader.download_and_stitch(ch_url, ch_ttl)
+                        if zp:
+                            dl_link = (await self.downloader.upload_to_gdrive(zp, os.path.basename(zp))
+                                       or await self.downloader.upload_to_gofile(zp)
+                                       or await self.downloader.upload_to_catbox(zp))
+                            self.downloader.cleanup(zp)
 
-                        channel = self.bot.get_channel(channel_id)
-                        if channel:
-                            embed = discord.Embed(
-                                title="🚨 فصل جديد!",
-                                description=(
-                                    f"**الفصل {_chapter_label(latest)}** متاح الآن\n"
-                                    f"*(الفصل السابق: {_chapter_label(last_chapter)})*\n\n"
-                                    f"[🔗 رابط الموقع]({url})"
-                                ),
-                                color=COLOR_RADAR,
-                                timestamp=now,
-                            )
-                            if download_link:
-                                embed.add_field(name="📥 تحميل مباشر", value=f"[اضغط هنا]({download_link})", inline=False)
-                            embed.set_footer(text="Cat-Bi Radar • يتابع الفصول تلقائياً")
-                            await channel.send(content=custom_msg, embed=embed)
+                    ch = self.bot.get_channel(cid)
+                    if ch:
+                        em = discord.Embed(
+                            title="🚨 فصل جديد!",
+                            description=(
+                                f"**الفصل {_lbl(latest)}** متاح الآن\n"
+                                f"*(السابق: {_lbl(last_ch)})*\n\n"
+                                f"[🔗 رابط الموقع]({url})"
+                            ),
+                            color=C_RADAR,
+                            timestamp=now,
+                        )
+                        if dl_link:
+                            em.add_field(name="📥 تحميل مباشر", value=f"[اضغط هنا]({dl_link})", inline=False)
+                        em.set_footer(text="Cat-Bi Radar")
+                        await ch.send(content=msg, embed=em)
 
-                        await database.update_tracker_chapter(tracker_id, latest, now.isoformat())
-                    else:
-                        await database.update_tracker_time(tracker_id, now.isoformat())
-
+                    await database.update_tracker_chapter(tid, latest, now.isoformat())
                 except Exception as e:
-                    print(f"❌ [الرادار] خطأ {tracker_id}: {e}")
-                    await database.update_tracker_time(tracker_id, now.isoformat())
+                    print(f"[Radar] ❌ {tid}: {e}")
+                    await database.update_tracker_time(tid, now.isoformat())
 
-        await asyncio.gather(*[check_one(row) for row in due])
+        await asyncio.gather(*[check_one(r) for r in due])
 
-    def _build_chapter_url(self, series_url: str, chapter_num: float) -> str:
-        num_str = _chapter_label(chapter_num)
-        new_url = re.sub(r'(chapter[s]?[-/])(\d+(?:\.\d+)?)', rf'\g<1>{num_str}', series_url, flags=re.I)
-        return new_url if new_url != series_url else series_url
+    def _build_ch_url(self, series_url: str, num: float) -> str:
+        ns = _lbl(num)
+        nu = re.sub(r'(chapter[s]?[-/])(\d+(?:\.\d+)?)', rf'\g<1>{ns}', series_url, flags=re.I)
+        return nu if nu != series_url else series_url
 
     # ── أوامر الأدمن ──────────────────────────────────────────────────────
     @app_commands.command(name="track_add", description="[أدمن] إضافة عمل لرادار الفصول.")
     @app_commands.describe(
-        url="رابط العمل.",
-        channel="الروم لاستقبال التنبيهات.",
-        custom_message="رسالة مرفقة (مثال: @everyone).",
-        interval_hours="كم ساعة بين كل فحص.",
-        current_chapter="رقم الفصل الحالي.",
-        auto_download="تحميل الفصل تلقائياً ورفعه."
+        url="رابط العمل", channel="روم الإشعارات",
+        custom_message="رسالة مرفقة (مثال: @everyone)",
+        interval_hours="فحص كل كم ساعة",
+        current_chapter="رقم الفصل الحالي",
+        auto_download="تحميل ورفع تلقائي"
     )
     @is_admin()
     @app_commands.guild_only()
-    async def track_add_command(
-        self, interaction: discord.Interaction,
-        url: str, channel: discord.TextChannel,
-        custom_message: str, interval_hours: int,
-        current_chapter: float, auto_download: bool = False
-    ):
+    async def track_add_cmd(self, interaction: discord.Interaction,
+                            url: str, channel: discord.TextChannel,
+                            custom_message: str, interval_hours: int,
+                            current_chapter: float, auto_download: bool = False):
         if interval_hours < 1:
-            return await interaction.response.send_message("❌ أقل مدة للفحص هي ساعة واحدة.", ephemeral=True)
-        await database.add_tracker(interaction.guild_id, channel.id, url, custom_message, interval_hours, current_chapter, 1 if auto_download else 0)
-        embed = discord.Embed(
+            return await interaction.response.send_message("❌ أقل مدة فحص: ساعة.", ephemeral=True)
+        await database.add_tracker(interaction.guild_id, channel.id, url,
+                                   custom_message, interval_hours, current_chapter,
+                                   1 if auto_download else 0)
+        em = discord.Embed(
             title="📡 تم تفعيل الرادار!",
             description=(
-                f"**الرابط:** {url}\n"
-                f"**الروم:** {channel.mention}\n"
-                f"**الفصل الحالي:** `{_chapter_label(current_chapter)}`\n"
-                f"**الفحص كل:** `{interval_hours}` ساعة\n"
-                f"**التحميل التلقائي:** {'✅ مفعل' if auto_download else '❌ معطل'}"
+                f"**الرابط:** {url}\n**الروم:** {channel.mention}\n"
+                f"**الفصل الحالي:** `{_lbl(current_chapter)}`\n"
+                f"**فحص كل:** `{interval_hours}h`\n"
+                f"**تحميل تلقائي:** {'✅' if auto_download else '❌'}"
             ),
-            color=COLOR_RADAR,
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
+            color=C_RADAR
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(name="track_list", description="[أدمن] عرض الأعمال المتتبعة في السيرفر.")
+    @app_commands.command(name="track_list", description="[أدمن] الأعمال المتتبعة.")
     @is_admin()
     @app_commands.guild_only()
-    async def track_list_command(self, interaction: discord.Interaction):
-        trackers = await database.get_all_trackers()
-        guild_trackers = [t for t in trackers if t[1] == interaction.guild_id]
-
-        if not guild_trackers:
-            return await interaction.response.send_message("لا توجد أعمال مُتابَعة في هذا السيرفر.", ephemeral=True)
-
-        embed = discord.Embed(title="📡 قائمة الرادار", color=COLOR_RADAR, timestamp=datetime.datetime.now(datetime.timezone.utc))
+    async def track_list_cmd(self, interaction: discord.Interaction):
+        rows = [r for r in await database.get_all_trackers() if r[1] == interaction.guild_id]
+        if not rows:
+            return await interaction.response.send_message("لا توجد أعمال مُتابَعة.", ephemeral=True)
+        em = discord.Embed(title="📡 قائمة الرادار", color=C_RADAR,
+                           timestamp=datetime.datetime.now(datetime.timezone.utc))
         desc = ""
-        for t_id, g_id, c_id, url, last_ch, msg, interval, last_chk, dl_en in guild_trackers:
-            ch   = self.bot.get_channel(c_id)
-            name = ch.mention if ch else "روم محذوفة"
-            desc += (
-                f"**`ID:{t_id}`** — **{_series_name(url)}**\n"
-                f"↳ الروم: {name} | آخر فصل: `{_chapter_label(last_ch)}` | كل `{interval}h` | تحميل: {'✅' if dl_en else '❌'}\n\n"
-            )
-        embed.description = desc[:3900]
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        for tid, gid, cid, url, lch, msg, interval, _, dl in rows:
+            ch   = self.bot.get_channel(cid)
+            name = ch.mention if ch else "محذوف"
+            desc += (f"**`ID:{tid}`** — **{_series_name(url)}**\n"
+                     f"↳ {name} | Ch.{_lbl(lch)} | كل {interval}h | تحميل:{'✅' if dl else '❌'}\n\n")
+        em.description = desc[:3900]
+        await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(name="track_remove", description="[أدمن] إزالة عمل من الرادار بالـ ID.")
-    @app_commands.describe(tracker_id="رقم الـ ID من track_list.")
+    @app_commands.command(name="track_remove", description="[أدمن] إزالة متتبع بالـ ID.")
+    @app_commands.describe(tracker_id="الـ ID من track_list")
     @is_admin()
     @app_commands.guild_only()
-    async def track_remove_command(self, interaction: discord.Interaction, tracker_id: int):
-        success = await database.remove_tracker(tracker_id, interaction.guild_id)
-        if success:
-            await interaction.response.send_message(f"✅ تمت إزالة الرادار `{tracker_id}` بنجاح.", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ لم يُعثر على هذا الـ ID في سيرفرك.", ephemeral=True)
+    async def track_remove_cmd(self, interaction: discord.Interaction, tracker_id: int):
+        ok = await database.remove_tracker(tracker_id, interaction.guild_id)
+        em = discord.Embed(
+            title="✅ تمت الإزالة" if ok else "❌ لم يُعثر عليه",
+            description=f"الرادار `{tracker_id}`" if ok else "تأكد من الـ ID.",
+            color=C_DONE if ok else C_FAIL
+        )
+        await interaction.response.send_message(embed=em, ephemeral=True)
 
     # ── تحميل مباشر ───────────────────────────────────────────────────────
-    @app_commands.command(name="download_chapter", description="تحميل فصل برابط مباشر كملف ZIP.")
+    @app_commands.command(name="download_chapter", description="تحميل فصل برابط مباشر (ZIP).")
     @app_commands.describe(url="رابط الفصل")
     @is_admin()
-    async def download_chapter_cmd(self, interaction: discord.Interaction, url: str):
+    async def dl_chapter_cmd(self, interaction: discord.Interaction, url: str):
         await interaction.response.defer()
-
-        msg_obj = await interaction.followup.send("⏳ **جاري التجهيز...**")
+        msg = await interaction.followup.send("⏳ جاري التجهيز...")
 
         async def pcb(cur, tot, txt):
             bar = self.downloader.create_progress_bar(cur, tot)
             try:
-                await msg_obj.edit(content=f"⏳ **{txt}**\n{bar}")
+                await msg.edit(content=f"⏳ **{txt}**\n{bar}")
             except Exception:
                 pass
 
         try:
-            ch_title  = f"Manual_{url.rstrip('/').split('/')[-2]}"
-            file_path = await self.downloader.download_and_stitch(url, ch_title, progress_callback=pcb)
-            if not file_path:
-                await msg_obj.edit(content="❌ فشل تحميل الصور. تأكد من الرابط.")
-                return
-
-            link = provider = None
+            ttl = f"Manual_{url.rstrip('/').split('/')[-2]}"
+            fp  = await self.downloader.download_and_stitch(url, ttl, progress_callback=pcb)
+            if not fp:
+                return await msg.edit(content="❌ فشل تحميل الصور.")
+            link = prov = None
             for pname, pfn in [
-                ("Google Drive", lambda f: self.downloader.upload_to_gdrive(f, os.path.basename(f), progress_callback=pcb)),
-                ("Gofile",       lambda f: self.downloader.upload_to_gofile(f, progress_callback=pcb)),
-                ("Catbox",       lambda f: self.downloader.upload_to_catbox(f, progress_callback=pcb)),
+                ("Drive",  lambda f: self.downloader.upload_to_gdrive(f, os.path.basename(f), progress_callback=pcb)),
+                ("Gofile", lambda f: self.downloader.upload_to_gofile(f, progress_callback=pcb)),
+                ("Catbox", lambda f: self.downloader.upload_to_catbox(f, progress_callback=pcb)),
             ]:
                 await pcb(0, 1, f"☁️ رفع إلى {pname}...")
-                link = await pfn(file_path)
+                link = await pfn(fp)
                 if link:
-                    provider = pname
+                    prov = pname
                     break
-
-            self.downloader.cleanup(file_path)
+            self.downloader.cleanup(fp)
             if link:
-                embed = discord.Embed(
-                    title="✅ تم تحميل الفصل (ZIP)",
-                    description=f"**المزود:** {provider}\n[📥 اضغط هنا للتحميل]({link})",
-                    color=COLOR_DONE,
-                    timestamp=datetime.datetime.now(datetime.timezone.utc)
+                em = discord.Embed(
+                    title="✅ الفصل جاهز (ZIP)",
+                    description=f"**المزود:** {prov}\n[📥 اضغط هنا]({link})",
+                    color=C_DONE, timestamp=datetime.datetime.now(datetime.timezone.utc)
                 )
-                await msg_obj.edit(content=None, embed=embed)
+                await msg.edit(content=None, embed=em)
             else:
-                await msg_obj.edit(content="❌ تم التحميل لكن فشل الرفع على Drive وGofile وCatbox.")
+                await msg.edit(content="❌ فشل الرفع على Drive/Gofile/Catbox.")
         except Exception as e:
-            await msg_obj.edit(content=f"❌ خطأ: {str(e)}")
+            await msg.edit(content=f"❌ خطأ: {e}")
 
     # ── تحميل نطاق ─────────────────────────────────────────────────────────
     @app_commands.command(name="download_range", description="تحميل نطاق فصول — ضع {num} مكان رقم الفصل.")
-    @app_commands.describe(
-        base_url="رابط مع {num} مكان رقم الفصل.",
-        start_ch="أول فصل", end_ch="آخر فصل"
-    )
+    @app_commands.describe(base_url="رابط مع {num}", start_ch="أول فصل", end_ch="آخر فصل")
     @is_admin()
-    async def download_range_cmd(self, interaction: discord.Interaction, base_url: str, start_ch: int, end_ch: int):
+    async def dl_range_cmd(self, interaction: discord.Interaction,
+                           base_url: str, start_ch: int, end_ch: int):
         if "{num}" not in base_url:
             return await interaction.response.send_message("❌ الرابط يجب أن يحتوي على `{num}`.", ephemeral=True)
         if end_ch < start_ch or (end_ch - start_ch) > 20:
             return await interaction.response.send_message("❌ النطاق غير صالح (الحد 20 فصل).", ephemeral=True)
-
-        await interaction.response.send_message(f"⏳ بدء تحميل الفصول {start_ch}→{end_ch}...")
+        await interaction.response.send_message(f"⏳ بدء تحميل {start_ch}→{end_ch}...")
 
         for ch in range(start_ch, end_ch + 1):
             url  = base_url.replace("{num}", str(ch))
-            smsg = await interaction.channel.send(f"⏳ **الفصل {ch}:** جاري البدء...")
+            smsg = await interaction.channel.send(f"⏳ **Ch.{ch}:** جاري...")
             await asyncio.sleep(2)
 
-            async def rcb(cur, tot, txt, _smsg=smsg, _ch=ch):
-                bar = self.downloader.create_progress_bar(cur, tot)
+            async def rcb(cur, tot, txt, _s=smsg, _c=ch):
                 try:
-                    await _smsg.edit(content=f"⏳ **الفصل {_ch}:** {txt}\n{bar}")
+                    await _s.edit(content=f"⏳ **Ch.{_c}:** {txt}\n{self.downloader.create_progress_bar(cur,tot)}")
                 except Exception:
                     pass
 
             try:
                 fp = await self.downloader.download_and_stitch(url, f"Ch_{ch}", progress_callback=rcb)
                 if not fp:
-                    await smsg.edit(content=f"❌ **الفصل {ch}:** فشل التحميل.")
-                    continue
+                    await smsg.edit(content=f"❌ **Ch.{ch}:** فشل."); continue
                 link = prov = None
                 for pname, pfn in [
-                    ("Google Drive", lambda f: self.downloader.upload_to_gdrive(f, os.path.basename(f), progress_callback=rcb)),
-                    ("Gofile",       lambda f: self.downloader.upload_to_gofile(f, progress_callback=rcb)),
-                    ("Catbox",       lambda f: self.downloader.upload_to_catbox(f, progress_callback=rcb)),
+                    ("Drive",  lambda f: self.downloader.upload_to_gdrive(f, os.path.basename(f), progress_callback=rcb)),
+                    ("Gofile", lambda f: self.downloader.upload_to_gofile(f, progress_callback=rcb)),
+                    ("Catbox", lambda f: self.downloader.upload_to_catbox(f, progress_callback=rcb)),
                 ]:
                     link = await pfn(fp)
                     if link:
-                        prov = pname
-                        break
+                        prov = pname; break
                 self.downloader.cleanup(fp)
                 if link:
-                    em = discord.Embed(title=f"✅ الفصل {ch}", description=f"**{prov}**\n[📥 تحميل]({link})", color=COLOR_DONE)
-                    await smsg.edit(content=None, embed=em)
+                    await smsg.edit(content=None, embed=discord.Embed(
+                        title=f"✅ Ch.{ch}", description=f"**{prov}**\n[📥 تحميل]({link})", color=C_DONE))
                 else:
-                    await smsg.edit(content=f"❌ **الفصل {ch}:** فشل الرفع على Drive وGofile وCatbox.")
+                    await smsg.edit(content=f"❌ **Ch.{ch}:** فشل الرفع.")
             except Exception as e:
-                await interaction.channel.send(f"❌ **الفصل {ch}:** {str(e)}")
+                await interaction.channel.send(f"❌ **Ch.{ch}:** {e}")
 
-        await interaction.channel.send("🏁 **اكتمل تحميل النطاق بالكامل.**")
+        await interaction.channel.send("🏁 **اكتمل النطاق.**")
 
     # ── تحميل سلسلة ────────────────────────────────────────────────────────
-    @app_commands.command(name="download_series", description="استخراج ذكي: ضع رابط السلسلة وسيجلب البوت الفصول تلقائياً.")
+    @app_commands.command(name="download_series", description="استخراج ذكي للسلسلة ثم تحميل النطاق.")
     @app_commands.describe(series_url="رابط صفحة المانجا", start_ch="أول فصل", end_ch="آخر فصل")
     @is_admin()
-    async def download_series_cmd(self, interaction: discord.Interaction, series_url: str, start_ch: float, end_ch: float):
+    async def dl_series_cmd(self, interaction: discord.Interaction,
+                            series_url: str, start_ch: float, end_ch: float):
         if end_ch < start_ch or (end_ch - start_ch) > 20:
-            return await interaction.response.send_message("❌ النطاق غير صالح (الحد 20 فصل).", ephemeral=True)
-
-        await interaction.response.send_message("🔍 **جاري تحليل الصفحة...**")
-        chapters_dict = await self.provider_manager.get_all_chapters(series_url)
-        if not chapters_dict:
+            return await interaction.response.send_message("❌ النطاق غير صالح (الحد 20).", ephemeral=True)
+        await interaction.response.send_message("🔍 جاري تحليل الصفحة...")
+        chs = await self.provider_manager.get_all_chapters(series_url)
+        if not chs:
             return await interaction.channel.send("❌ فشل استخراج الفصول.")
-
-        target = {n: u for n, u in chapters_dict.items() if start_ch <= n <= end_ch}
+        target = {n: u for n, u in chs.items() if start_ch <= n <= end_ch}
         if not target:
-            rng = f"من {min(chapters_dict)} إلى {max(chapters_dict)}"
-            return await interaction.channel.send(f"❌ لا فصول في هذا النطاق. المتاح: {rng}")
-
-        await interaction.channel.send(f"⏳ **{len(target)} فصول جاهزة للتحميل...**")
-
-        for ch_num, url in sorted(target.items()):
-            smsg = await interaction.channel.send(f"⏳ **الفصل {_chapter_label(ch_num)}:** جاري البدء...")
+            return await interaction.channel.send(f"❌ لا فصول في هذا النطاق. المتاح: {min(chs)}→{max(chs)}")
+        await interaction.channel.send(f"⏳ **{len(target)} فصول للتحميل...**")
+        for ch_n, url in sorted(target.items()):
+            smsg = await interaction.channel.send(f"⏳ **Ch.{_lbl(ch_n)}:** جاري...")
             await asyncio.sleep(2)
 
-            async def scb(cur, tot, txt, _smsg=smsg, _n=ch_num):
-                bar = self.downloader.create_progress_bar(cur, tot)
+            async def scb(cur, tot, txt, _s=smsg, _n=ch_n):
                 try:
-                    await _smsg.edit(content=f"⏳ **الفصل {_chapter_label(_n)}:** {txt}\n{bar}")
+                    await _s.edit(content=f"⏳ **Ch.{_lbl(_n)}:** {txt}\n{self.downloader.create_progress_bar(cur,tot)}")
                 except Exception:
                     pass
 
             try:
-                fp = await self.downloader.download_and_stitch(url, f"Ch_{ch_num}", progress_callback=scb)
+                fp = await self.downloader.download_and_stitch(url, f"Ch_{ch_n}", progress_callback=scb)
                 if not fp:
-                    await smsg.edit(content=f"❌ **الفصل {_chapter_label(ch_num)}:** فشل.")
-                    continue
+                    await smsg.edit(content=f"❌ **Ch.{_lbl(ch_n)}:** فشل."); continue
                 link = prov = None
                 for pname, pfn in [
-                    ("Google Drive", lambda f: self.downloader.upload_to_gdrive(f, os.path.basename(f), progress_callback=scb)),
-                    ("Gofile",       lambda f: self.downloader.upload_to_gofile(f, progress_callback=scb)),
-                    ("Catbox",       lambda f: self.downloader.upload_to_catbox(f, progress_callback=scb)),
+                    ("Drive",  lambda f: self.downloader.upload_to_gdrive(f, os.path.basename(f), progress_callback=scb)),
+                    ("Gofile", lambda f: self.downloader.upload_to_gofile(f, progress_callback=scb)),
+                    ("Catbox", lambda f: self.downloader.upload_to_catbox(f, progress_callback=scb)),
                 ]:
                     link = await pfn(fp)
                     if link:
-                        prov = pname
-                        break
+                        prov = pname; break
                 self.downloader.cleanup(fp)
                 if link:
-                    em = discord.Embed(title=f"✅ الفصل {_chapter_label(ch_num)}", description=f"**{prov}**\n[📥 تحميل]({link})", color=COLOR_DONE)
-                    await smsg.edit(content=None, embed=em)
+                    await smsg.edit(content=None, embed=discord.Embed(
+                        title=f"✅ Ch.{_lbl(ch_n)}", description=f"**{prov}**\n[📥 تحميل]({link})", color=C_DONE))
                 else:
-                    await smsg.edit(content=f"❌ **الفصل {_chapter_label(ch_num)}:** فشل الرفع على Drive وGofile وCatbox.")
+                    await smsg.edit(content=f"❌ **Ch.{_lbl(ch_n)}:** فشل الرفع.")
             except Exception as e:
-                await interaction.channel.send(f"❌ **الفصل {_chapter_label(ch_num)}:** {str(e)}")
+                await interaction.channel.send(f"❌ **Ch.{_lbl(ch_n)}:** {e}")
+        await interaction.channel.send("🏁 **اكتملت السلسلة.**")
 
-        await interaction.channel.send("🏁 **اكتملت سلسلة التحميلات.**")
-
-    # ── لوحة التحكم ─────────────────────────────────────────────────────────
-    @app_commands.command(name="manga_panel", description="لوحة تحكم احترافية لتحميل الفصول (مع تقليب صفحات).")
-    @app_commands.describe(url="الرابط الرئيسي لصفحة المانجا/المانهوا")
+    # ── لوحة التحكم (manga_panel) ──────────────────────────────────────────
+    @app_commands.command(name="manga_panel", description="لوحة تحكم للتصفح الكامل وتحميل الفصول.")
+    @app_commands.describe(url="الرابط الرئيسي للمانجا/المانهوا")
     @is_admin()
-    async def download_panel_cmd(self, interaction: discord.Interaction, url: str):
-        await interaction.response.send_message("🔍 **جاري تحليل الصفحة وجلب الفصول...**")
-
+    async def manga_panel_cmd(self, interaction: discord.Interaction, url: str):
+        await interaction.response.send_message("🔍 جاري جلب قائمة الفصول...")
         try:
-            chapters_dict = await self.provider_manager.get_all_chapters(url)
-            if not chapters_dict:
+            chs = await self.provider_manager.get_all_chapters(url)
+            if not chs:
                 return await interaction.edit_original_response(content="❌ فشل استخراج الفصول. تأكد من الرابط.")
-
-            view  = MangaPanelView(self.bot, self.downloader, self.provider_manager, url, chapters_dict, requester=interaction.user)
-            embed = view.build_embed(f"✅ تم جلب {len(chapters_dict)} فصل. اختر من القائمة أو استخدم الأزرار.")
-            await interaction.edit_original_response(content=None, embed=embed, view=view)
-
+            view = MangaPanelView(
+                self.bot, self.downloader, self.provider_manager,
+                url, chs, requester=interaction.user
+            )
+            em = view.build_embed(
+                f"✅ تم جلب **{len(chs)}** فصل. تصفح الصفحات واختر ما تريد، ثم اضغط 🚀 للبدء."
+            )
+            await interaction.edit_original_response(content=None, embed=em, view=view)
         except Exception as e:
-            await interaction.edit_original_response(content=f"❌ حدث خطأ: {str(e)}")
+            await interaction.edit_original_response(content=f"❌ خطأ: {e}")
 
 
 async def setup(bot):
