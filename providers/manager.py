@@ -17,6 +17,12 @@ from .mangafire_provider import MangaFireProvider
 from .bato_provider import BatoProvider
 from .arabic_provider import ArabicProvider
 from .mangaplus_provider import MangaPlusProvider
+from .bilibili_provider import BilibiliProvider
+from .kakao_provider import KakaoProvider
+from .raw_providers import (
+    AcQQProvider, KuaikanProvider, LineMangaProvider,
+    PiccomaProvider, IqiyiProvider,
+)
 from gemini_client import GeminiClient
 from typing import List, Optional
 
@@ -40,9 +46,25 @@ class ProviderManager:
         self.bato        = BatoProvider()
         self.arabic      = ArabicProvider(scraper=self.generic.scraper)
         self.mangaplus   = MangaPlusProvider()
+        self.bilibili    = BilibiliProvider()
+        self.kakao       = KakaoProvider()
+        self.acqq        = AcQQProvider()
+        self.kuaikan     = KuaikanProvider()
+        self.linemanga   = LineMangaProvider()
+        self.piccoma     = PiccomaProvider()
+        self.iqiyi       = IqiyiProvider()
 
         self.gemini_client   = GeminiClient()
         self.gemini_fallback = GeminiProvider(self.gemini_client, scraper=self.generic.scraper)
+
+        # ── RAW الأصلية ──────────────────────────────────────────────────────
+        self.bilibili_sites  = ["manga.bilibili.com", "bilibili.com/manga"]
+        self.kakao_sites     = ["page.kakao.com", "webtoon.kakao.com", "kakaopage.com"]
+        self.acqq_sites      = ["ac.qq.com", "ac.q.qq.com"]
+        self.kuaikan_sites   = ["kuaikanmanhua.com", "kuaikan.com"]
+        self.linemanga_sites = ["manga.line.me", "lin.ee/manga"]
+        self.piccoma_sites   = ["piccoma.com", "piccoma.jp"]
+        self.iqiyi_sites     = ["manhua.iqiyi.com", "iqiyi.com/manhua"]
 
         # ── مواقع Manganato ───────────────────────────────────────────────────
         self.manganato_sites = [
@@ -51,19 +73,13 @@ class ProviderManager:
         ]
 
         # ── مواقع Bato ────────────────────────────────────────────────────────
-        self.bato_sites = [
-            "bato.to", "batotoo.com", "dto.to", "bato.site",
-        ]
+        self.bato_sites = ["bato.to", "batotoo.com", "dto.to", "bato.site"]
 
         # ── مواقع Comick ──────────────────────────────────────────────────────
-        self.comick_sites = [
-            "comick.fun", "comick.io", "comick.cc", "comick.app",
-        ]
+        self.comick_sites = ["comick.fun", "comick.io", "comick.cc", "comick.app"]
 
         # ── مواقع MangaFire ───────────────────────────────────────────────────
-        self.mangafire_sites = [
-            "mangafire.to",
-        ]
+        self.mangafire_sites = ["mangafire.to"]
 
         # ── المواقع العربية ───────────────────────────────────────────────────
         self.arabic_sites = [
@@ -72,13 +88,12 @@ class ProviderManager:
             "manga-ar.com", "mangaarab.com", "manga-ar.net",
             "arabsama.com", "mangaae.com", "ozulscans.com",
             "mangat.to", "mangat.me", "mangazone.net",
-            "gmanga.org", "onma.net",
-            "mangaadm.com", "7oman.com",
-            "shaymanga.net", "mangaswat.com",
+            "gmanga.org", "onma.net", "mangaadm.com",
+            "7oman.com", "shaymanga.net", "mangaswat.com",
             "mangatime.com",
         ]
 
-        # ── مواقع Madara WordPress (100+ موقع) ───────────────────────────────
+        # ── مواقع Madara WordPress — إنجليزية + متعددة اللغات ────────────────
         self.madara_sites = [
             # Flame / Reaper / Luminous / Night
             "flamescans.org", "flamecomics.xyz", "flamecomics.me", "flamecomics.io",
@@ -86,11 +101,10 @@ class ProviderManager:
             "luminousscans.net", "luminousscans.com",
             "nightscans.net", "nightcomic.com",
             "disasterscans.com",
-            # كورية / ترجمة إنجليزية شهيرة
+            # كورية / إنجليزية
             "toonily.com", "toonily.net",
             "manhuaplus.com", "manhuafast.com",
-            "webtoon.xyz",
-            "mangaonlineteam.com", "mangapro.com",
+            "webtoon.xyz", "mangaonlineteam.com",
             "utoon.net", "utoon.co",
             "isekaiscan.com", "isekaiscan.to",
             "azuremanga.com", "aquamanga.com",
@@ -102,64 +116,121 @@ class ProviderManager:
             "manhwaclan.com", "manhwatop.com",
             "toongod.org", "mangaclash.com",
             "biblioscan.me", "rawkuma.com",
-            "manga68.com", "manhua88.com",
-            "manhuazone.net",
-            "chapscans.com", "drake-scans.com",
-            "void-scans.com",
-            # Scans شهيرة
-            "reset-scans.com", "reset-scans.us",
-            "alpha-scans.net",
+            "manga68.com", "manhua88.com", "manhuazone.net",
+            "chapscans.com", "drake-scans.com", "void-scans.com",
+            # Scans
+            "reset-scans.com", "alpha-scans.net",
             "hivescans.com", "hive-scans.com",
-            "dragontea.ink",
-            "suryascans.com",
-            "immortalupdates.com",
-            "nitroscans.com",
-            "mangapanda.onl", "mangapanda.in",
-            "secretscans.com",
-            "mangadistrict.com",
-            "phenixscans.fr", "phenixscans.com",
-            "setsuscans.com",
-            "leviatanscans.com",
+            "dragontea.ink", "suryascans.com",
+            "immortalupdates.com", "nitroscans.com",
+            "secretscans.com", "mangadistrict.com",
+            "setsuscans.com", "leviatanscans.com",
+            "zeroscans.com", "skymanga.xyz",
+            "asura.nacm.xyz",
+            # ── فرنسية (Top French) ──────────────────────────────────────────
             "sushiscan.net", "sushiscan.fr",
-            # مانهوا / مانهوا صينية
+            "phenixscans.fr", "phenixscans.com",
+            "scantrad-vf.co", "scantrad.net",
+            "scan-vf.net", "scan-vf.to",
+            "fr.mangatoto.com",
+            "mangas-origines.fr",
+            "japanread.fr",
+            "mangaparadise.fr",
+            "lelscan-vf.com",
+            "animesama.fr",
+            "scansmangas.com",
+            "manga-scantrad.net",
+            "scan-manga.com",
+            # ── إندونيسية (Top Indonesian) ──────────────────────────────────
+            "komiku.org", "komiku.id",
+            "manhwaindo.id", "manhwaindo.net",
+            "komikcast.com", "komikcast.biz",
+            "mangkomik.id", "mangkomik.com",
+            "kiryuu.id", "kiryuu.co",
+            "westmanga.id", "westmanga.net",
+            "gudangkomik.com",
+            "klikmanga.id",
+            "bacakomik.co",
+            "doujindesu.tv",
+            "rawkuma.com",
+            "shinigamid.me",
+            # ── إسبانية (Top Spanish) ────────────────────────────────────────
+            "tumangaonline.co", "tumangaonline.org",
+            "lectortmo.com",
+            "mangatigre.com",
+            "mangaes.net",
+            "manhuaes.com",
+            "leercomics.com",
+            "ikigaimangas.com",
+            "mangatigre.org",
+            # ── برتغالية (Top Portuguese) ────────────────────────────────────
+            "mangalivre.net", "mangalivre.org",
+            "unionmangas.xyz", "unionmangas.net",
+            "brmangas.net", "brmangas.com",
+            "mangasproject.net",
+            "centraldemangas.net",
+            "taosect.com",
+            # ── روسية (Top Russian) ──────────────────────────────────────────
+            "mangalib.me", "mangalib.org",
+            "remanga.org",
+            "readmanga.live",
+            "manga-chan.me",
+            # ── تايلاندية ─────────────────────────────────────────────────────
+            "manga108.org",
+            "mangathailand.com",
+            # ── ألمانية ───────────────────────────────────────────────────────
+            "mangalist.de",
+            "manfra.de",
+            "mangadeutsch.com",
+            # ── إيطالية ───────────────────────────────────────────────────────
+            "mangaworld.biz", "mangaworld.ac",
+            "mangaeden.com",
+            # ── متنوعة ────────────────────────────────────────────────────────
+            "mangageko.com", "mangahere.cc",
+            "readmanga.today", "mangabuddy.com",
+            "harimanga.com",
+            "klmanga.net", "klmanga.com",
+            "manga4life.com", "mangasee123.com",
+            "mangakomi.io", "mangajar.com",
+            "mangaread.org", "rawmanga.top",
+            "readm.org", "readmangabat.com",
+            "galaxymanga.net", "galaxymanga.org",
+            "mangaowl.net", "mangaowl.to",
+            "colamanga.com", "manhwabuddy.com",
+            "manytoon.com", "manhwa18.com", "manhwa18.org",
+            "manhwax.com", "mangaraw.org", "mangarawjp.io",
             "manhuadex.com", "manhuascan.us",
             "readmanhua.com", "readmanhuax.com",
             "manhwafreaks.com", "readmanhwa.com",
-            "kingofshojo.com",
-            "lhtranslation.net",
-            "scansmangas.com",
-            # مواقع متنوعة
-            "mangageko.com",
-            "mangahere.cc",
-            "readmanga.today",
-            "mangabuddy.com",
-            "harimanga.com",
-            "klmanga.net", "klmanga.com",
-            "manga4life.com",
-            "mangasee123.com",
-            "mangaworld.biz", "mangaworld.ac",
-            "mangakomi.io",
-            "mangajar.com",
-            "mangaread.org",
-            "mangaraw.org", "mangarawjp.io",
-            "rawmanga.top",
-            "readm.org", "readmangabat.com",
-            "zeroscans.com",
-            "galaxymanga.net", "galaxymanga.org",
-            "mangaowl.net", "mangaowl.to",
-            "colamanga.com",
-            "manhwabuddy.com",
-            "manytoon.com",
-            "manhwa18.com", "manhwa18.org",
-            "manhwax.com",
-            "asura.nacm.xyz",
-            "skymanga.xyz",
+            "kingofshojo.com", "lhtranslation.net",
         ]
 
     def get_provider(self, url: str):
         url_lower = url.lower()
 
-        # مزودات بـ API مخصص
+        # ── RAW الأصلية ───────────────────────────────────────────────────
+        if any(x in url_lower for x in self.bilibili_sites):
+            return self.bilibili
+
+        if any(x in url_lower for x in self.kakao_sites):
+            return self.kakao
+
+        if any(x in url_lower for x in self.acqq_sites):
+            return self.acqq
+
+        if any(x in url_lower for x in self.kuaikan_sites):
+            return self.kuaikan
+
+        if any(x in url_lower for x in self.linemanga_sites):
+            return self.linemanga
+
+        if any(x in url_lower for x in self.piccoma_sites):
+            return self.piccoma
+
+        if any(x in url_lower for x in self.iqiyi_sites):
+            return self.iqiyi
+
+        # ── مزودات بـ API مخصص ────────────────────────────────────────────
         if "mangadex.org" in url_lower:
             return self.mangadex
 
@@ -175,7 +246,7 @@ class ProviderManager:
         if any(x in url_lower for x in self.bato_sites):
             return self.bato
 
-        # مزودات مخصصة
+        # ── مزودات مخصصة ─────────────────────────────────────────────────
         if any(x in url_lower for x in ["asurascans", "asura.gg", "asuracomics",
                                           "asuratoon", "asura.nacm.xyz"]):
             return self.asura
@@ -204,11 +275,11 @@ class ProviderManager:
         if any(x in url_lower for x in ["tcbscans", "tcb-scans"]):
             return self.tcbscans
 
-        # المواقع العربية
+        # ── المواقع العربية ───────────────────────────────────────────────
         if any(s in url_lower for s in self.arabic_sites):
             return self.arabic
 
-        # Madara WordPress
+        # ── Madara WordPress ──────────────────────────────────────────────
         if any(s in url_lower for s in self.madara_sites):
             return self.madara
 

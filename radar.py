@@ -11,14 +11,16 @@ from manga_downloader import MangaDownloader
 
 RADAR_CONCURRENT  = 5
 CHAPTERS_PER_PAGE = 20
+DL_CONCURRENT     = 3       # فصول تتحمّل بالتوازي في البانل
 
 # ── ألوان ─────────────────────────────────────────────────────────────────
-C_IDLE  = discord.Color.from_rgb(30,  31,  34)    # خلفية داكنة محايدة
-C_RUN   = discord.Color.from_rgb(245, 158,  11)   # ذهبي عنبري
-C_DONE  = discord.Color.from_rgb(34,  197,  94)   # أخضر نضاري
-C_FAIL  = discord.Color.from_rgb(239,  68,  68)   # أحمر
-C_RADAR = discord.Color.from_rgb(99,  102, 241)   # بنفسجي indigo
-C_GREY  = discord.Color.from_rgb(71,  85, 105)    # رمادي سليت
+C_IDLE  = discord.Color.from_rgb(30,  31,  34)
+C_RUN   = discord.Color.from_rgb(245, 158,  11)
+C_DONE  = discord.Color.from_rgb(34,  197,  94)
+C_FAIL  = discord.Color.from_rgb(239,  68,  68)
+C_RADAR = discord.Color.from_rgb(99,  102, 241)
+C_GREY  = discord.Color.from_rgb(71,  85, 105)
+C_INFO  = discord.Color.from_rgb(56, 189, 248)
 
 # ── أيقونات الحالة ─────────────────────────────────────────────────────────
 ICO = {
@@ -32,7 +34,6 @@ ICO = {
     "failed":      "✗",
 }
 
-# ── شريط تقدم عصري ────────────────────────────────────────────────────────
 def pbar(pct: int, length: int = 16) -> str:
     filled = int(round(pct / 100 * length))
     empty  = length - filled
@@ -95,8 +96,7 @@ class RangeModal(ui.Modal, title="تحديد نطاق الفصول"):
 
         if not sel:
             return await interaction.response.send_message(
-                f"❌  لم يُعثر على فصول بهذه القيمة.\n"
-                f"الفصول المتاحة: `{_lbl(min(nums))}` ← `{_lbl(max(nums))}`",
+                f"❌  لم يُعثر على فصول.\nالمتاح: `{_lbl(min(nums))}` ← `{_lbl(max(nums))}`",
                 ephemeral=True,
             )
 
@@ -113,7 +113,67 @@ class RangeModal(ui.Modal, title="تحديد نطاق الفصول"):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  MangaPanelView
+#  Modal — إعدادات SmartStitch
+# ─────────────────────────────────────────────────────────────────────────
+class StitchSettingsModal(ui.Modal, title="إعدادات SmartStitch"):
+    width = ui.TextInput(
+        label="عرض الصورة (px)",
+        placeholder="800",
+        default="800",
+        min_length=2, max_length=5,
+        required=True,
+    )
+    height = ui.TextInput(
+        label="الحد الأقصى للارتفاع (px)",
+        placeholder="14500",
+        default="14500",
+        min_length=3, max_length=6,
+        required=True,
+    )
+    sensitivity = ui.TextInput(
+        label="حساسية الدمج (1-100)",
+        placeholder="90",
+        default="90",
+        min_length=1, max_length=3,
+        required=True,
+    )
+
+    def __init__(self, panel: "MangaPanelView"):
+        super().__init__()
+        self.panel = panel
+        self.width.default       = str(panel.stitch_width)
+        self.height.default      = str(panel.stitch_height)
+        self.sensitivity.default = str(panel.stitch_sensitivity)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            w = int(self.width.value.strip())
+            h = int(self.height.value.strip())
+            s = int(self.sensitivity.value.strip())
+            if not (200 <= w <= 4000):
+                raise ValueError("عرض غير صالح")
+            if not (3000 <= h <= 50000):
+                raise ValueError("ارتفاع غير صالح")
+            if not (1 <= s <= 100):
+                raise ValueError("حساسية غير صالحة")
+            self.panel.stitch_width       = w
+            self.panel.stitch_height      = h
+            self.panel.stitch_sensitivity = s
+            self.panel._rebuild()
+            await interaction.response.edit_message(
+                embed=self.panel.build_embed(
+                    f"⚙️  SmartStitch  │  {w}px × {h}px  │  حساسية {s}%"
+                ),
+                view=self.panel,
+            )
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌  قيم غير صالحة: {e}", ephemeral=True
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  MangaPanelView — محسّن كلياً
 # ─────────────────────────────────────────────────────────────────────────
 class MangaPanelView(ui.View):
 
@@ -136,7 +196,23 @@ class MangaPanelView(ui.View):
         self.ch_status    : dict        = {}
         self.running                    = False
 
+        # ── إعدادات SmartStitch ────────────────────────────────────────────
+        self.stitch_enabled   : bool = True      # SmartStitch ON/OFF
+        self.stitch_width     : int  = 800
+        self.stitch_height    : int  = 14500
+        self.stitch_sensitivity: int = 90
+
+        # ── ترتيب الفصول ──────────────────────────────────────────────────
+        self.sort_desc : bool = True   # True = تنازلي (أحدث أولاً)
+
         self._rebuild()
+
+    # ── الترتيب ────────────────────────────────────────────────────────────
+    def _apply_sort(self):
+        self.all_chapters = sorted(
+            self.all_chapters,
+            reverse=self.sort_desc,
+        )
 
     @property
     def total_pages(self) -> int:
@@ -188,7 +264,8 @@ class MangaPanelView(ui.View):
         at_e = self.page >= self.total_pages - 1
         d    = self.running
 
-        for emoji, cb, dis in [("⏮️", self._cb_first, at_s or d), ("◀️", self._cb_prev, at_s or d)]:
+        for emoji, cb, dis in [("⏮️", self._cb_first, at_s or d),
+                                ("◀️", self._cb_prev,  at_s or d)]:
             b = ui.Button(emoji=emoji, style=discord.ButtonStyle.secondary, row=1, disabled=dis)
             b.callback = cb; self.add_item(b)
 
@@ -197,30 +274,62 @@ class MangaPanelView(ui.View):
             style=discord.ButtonStyle.secondary, row=1, disabled=True,
         ))
 
-        for emoji, cb, dis in [("▶️", self._cb_next, at_e or d), ("⏭️", self._cb_last, at_e or d)]:
+        for emoji, cb, dis in [("▶️", self._cb_next, at_e or d),
+                                ("⏭️", self._cb_last, at_e or d)]:
             b = ui.Button(emoji=emoji, style=discord.ButtonStyle.secondary, row=1, disabled=dis)
             b.callback = cb; self.add_item(b)
 
         # ── صف 2: اختيار سريع ────────────────────────────────────────────
-        for emoji, lbl, style, cb in [
-            ("⭐", "آخر فصل",  discord.ButtonStyle.primary,   self._cb_l1),
+        sort_lbl  = "↓ أحدث" if self.sort_desc else "↑ أقدم"
+        sort_styl = discord.ButtonStyle.primary if self.sort_desc else discord.ButtonStyle.secondary
+
+        quick_row = [
+            ("⭐", "آخر 1",   discord.ButtonStyle.primary,   self._cb_l1),
             ("📦", "آخر 5",   discord.ButtonStyle.secondary,  self._cb_l5),
+            ("🔟", "آخر 10",  discord.ButtonStyle.secondary,  self._cb_l10),
             ("📄", "الصفحة",  discord.ButtonStyle.secondary,  self._cb_pg),
-            ("✏️", "نطاق",   discord.ButtonStyle.secondary,  self._cb_range),
-            ("🗑️", "مسح",   discord.ButtonStyle.danger,     self._cb_clear),
-        ]:
+            ("🔀", sort_lbl,  sort_styl,                      self._cb_sort),
+        ]
+        for emoji, lbl, style, cb in quick_row:
             b = ui.Button(emoji=emoji, label=lbl, style=style, row=2, disabled=self.running)
             b.callback = cb; self.add_item(b)
 
-        # ── صف 3: تحكم ───────────────────────────────────────────────────
+        # ── صف 3: أدوات ──────────────────────────────────────────────────
+        mode_lbl  = "⚡ ZIP فقط" if not self.stitch_enabled else "🪡 SmartStitch"
+        mode_styl = discord.ButtonStyle.secondary if not self.stitch_enabled else discord.ButtonStyle.primary
+        has_failed = any(
+            v.get("state") == "failed"
+            for v in self.ch_status.values()
+        )
+        tools_row = [
+            ("✏️", "نطاق",     discord.ButtonStyle.secondary, self._cb_range),
+            ("⚙️", "إعدادات", discord.ButtonStyle.secondary, self._cb_settings),
+            (None, mode_lbl,   mode_styl,                     self._cb_mode),
+            ("🗑️", "مسح",     discord.ButtonStyle.danger,    self._cb_clear),
+        ]
+        for emoji, lbl, style, cb in tools_row:
+            b = ui.Button(emoji=emoji, label=lbl, style=style, row=3, disabled=self.running)
+            b.callback = cb; self.add_item(b)
+
+        # ── صف 4: تشغيل / إعادة محاولة / إغلاق ──────────────────────────
+        fail_cnt = sum(1 for v in self.ch_status.values() if v.get("state") == "failed")
+
         b_go = ui.Button(
             label=f"  ابدأ التحميل  [ {len(self.selected)} ]",
-            style=discord.ButtonStyle.success, emoji="🚀", row=3, disabled=self.running,
+            style=discord.ButtonStyle.success, emoji="🚀", row=4,
+            disabled=self.running or not self.selected,
         )
         b_go.callback = self._cb_start; self.add_item(b_go)
 
-        b_x = ui.Button(label="  إغلاق", style=discord.ButtonStyle.secondary,
-                         emoji="✖️", row=3, disabled=self.running)
+        if fail_cnt and not self.running:
+            b_retry = ui.Button(
+                label=f"🔄 إعادة المحاولة [{fail_cnt}]",
+                style=discord.ButtonStyle.danger, row=4,
+            )
+            b_retry.callback = self._cb_retry; self.add_item(b_retry)
+
+        b_x = ui.Button(label="✖️ إغلاق", style=discord.ButtonStyle.secondary,
+                         row=4, disabled=self.running)
         b_x.callback = self._cb_close; self.add_item(b_x)
 
     # ── بناء الـ Embed ─────────────────────────────────────────────────────
@@ -234,7 +343,6 @@ class MangaPanelView(ui.View):
         selcnt = len(self.selected)
         pct_s  = int(selcnt / max(total, 1) * 100)
 
-        # ── title
         state_icon = "⚙️" if self.running else "📚"
         em = discord.Embed(
             title=f"{state_icon}  {series}",
@@ -242,17 +350,20 @@ class MangaPanelView(ui.View):
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
 
-        # ── description: info panel in code block ─────────────────────────
+        mode_txt   = "SmartStitch" if self.stitch_enabled else "ZIP فقط (سريع)"
+        sort_txt   = "تنازلي (أحدث أولاً)" if self.sort_desc else "تصاعدي (أقدم أولاً)"
         status_txt = "● جاري التحميل" if self.running else "● جاهز"
         em.description = (
             f"```yaml\n"
             f"  Site     : {site}\n"
             f"  Provider : {self.provider_name}\n"
+            f"  Mode     : {mode_txt}\n"
+            f"  Sort     : {sort_txt}\n"
             f"  Status   : {status_txt}\n"
-            f"─────────────────────────────\n"
+            f"─────────────────────────────────────────\n"
             f"  Chapters : {total:<6}  Selected : {selcnt} ({pct_s}%)\n"
             f"  Page     : {self.page+1}/{self.total_pages}"
-            f"{'  Range : Ch.' + _lbl(min(sel_s)) + ' → Ch.' + _lbl(max(sel_s)) if sel_s else ''}\n"
+            f"{'  Range: Ch.' + _lbl(min(sel_s)) + ' → ' + _lbl(max(sel_s)) if sel_s else ''}\n"
             f"```"
         )
 
@@ -285,17 +396,25 @@ class MangaPanelView(ui.View):
                 value=f"```\n{chr(10).join(rows)}\n```",
                 inline=False,
             )
-
-            # legend (مختصر)
-            legend = (
-                f"`◻` غير محدد  `◈` محدد  "
-                f"`↓` تحميل  `⊕` دمج  `↑` رفع  `✓` جاهز  `✗` فشل"
+            em.add_field(
+                name="",
+                value="`◻` غير محدد  `◈` محدد  `↓` تحميل  `⊕` دمج  `↑` رفع  `✓` جاهز  `✗` فشل",
+                inline=False,
             )
-            em.add_field(name="", value=legend, inline=False)
 
-        # ── download queue (أثناء التشغيل) ────────────────────────────────
+        # ── download queue ─────────────────────────────────────────────────
         if self.running:
-            lines = []
+            lines    = []
+            running_ = [n for n in self.selected
+                        if self.ch_status.get(n, {}).get("state") in
+                        ("downloading", "stitching", "uploading")]
+            queued_  = [n for n in self.selected
+                        if self.ch_status.get(n, {}).get("state") == "queued"]
+            done_n   = sum(1 for n in self.selected
+                           if self.ch_status.get(n, {}).get("state") == "done")
+            fail_n   = sum(1 for n in self.selected
+                           if self.ch_status.get(n, {}).get("state") == "failed")
+
             for n in sorted(self.selected):
                 st    = self.ch_status.get(n, {})
                 state = st.get("state", "queued")
@@ -306,7 +425,8 @@ class MangaPanelView(ui.View):
                 lbl   = _lbl(n)
 
                 if state == "done":
-                    line = f"`✓` **Ch.{lbl}**  ─  {prov}  [↗]({link})" if link else f"`✓` **Ch.{lbl}**"
+                    line = (f"`✓` **Ch.{lbl}**  ─  {prov}  [↗]({link})"
+                            if link else f"`✓` **Ch.{lbl}**")
                 elif state == "failed":
                     line = f"`✗` **Ch.{lbl}**  ─  {st.get('detail','فشل')[:35]}"
                 elif state in ("downloading", "uploading"):
@@ -318,12 +438,21 @@ class MangaPanelView(ui.View):
                     line = f"`◷` **Ch.{lbl}**  في الانتظار"
                 lines.append(line)
 
+            summary = (
+                f"⚡ **{len(running_)} يُحمَّل الآن**  "
+                f"│  ◷ {len(queued_)} انتظار  "
+                f"│  ✓ {done_n}  │  ✗ {fail_n}"
+            )
             chunk = lines[:10]
             if len(lines) > 10:
                 chunk.append(f"*... و {len(lines)-10} فصل آخر*")
-            em.add_field(name="⚡  قائمة التنفيذ", value="\n".join(chunk), inline=False)
+            em.add_field(
+                name=f"⚡  قائمة التنفيذ  ─  DL×{DL_CONCURRENT}",
+                value=summary + "\n" + "\n".join(chunk),
+                inline=False,
+            )
 
-        # ── روابط جاهزة (بعد انتهاء التحميل) ─────────────────────────────
+        # ── روابط جاهزة ───────────────────────────────────────────────────
         ready = [
             (n, self.ch_status[n])
             for n in sorted(self.selected)
@@ -339,7 +468,7 @@ class MangaPanelView(ui.View):
         if note:
             em.add_field(name="", value=f"```fix\n{note}\n```", inline=False)
 
-        em.set_footer(text=f"Cat-Bi  ·  Gofile → Catbox  ·  {site}")
+        em.set_footer(text=f"Cat-Bi  ·  {self.provider_name}  ·  {site}")
         return em
 
     # ── navigation callbacks ──────────────────────────────────────────────
@@ -347,7 +476,7 @@ class MangaPanelView(ui.View):
         chosen = {float(v) for v in interaction.data["values"]}
         page_s = set(self.page_chs)
         others = {n for n in self.selected if n not in page_s}
-        self.selected = sorted(others | chosen, reverse=True)
+        self.selected = sorted(others | chosen, reverse=self.sort_desc)
         self._rebuild()
         await interaction.response.edit_message(
             embed=self.build_embed(f"☑  محدد الآن: {len(self.selected)} فصل"),
@@ -370,25 +499,53 @@ class MangaPanelView(ui.View):
         self.page = self.total_pages - 1; self._rebuild()
         await i.response.edit_message(embed=self.build_embed(), view=self)
 
-    # ── quick-select callbacks ────────────────────────────────────────────
+    # ── quick-select ──────────────────────────────────────────────────────
     async def _cb_l1(self, i):
         self.selected = self.all_chapters[:1]; self._rebuild()
         await i.response.edit_message(
             embed=self.build_embed(f"⭐  آخر فصل  ─  Ch.{_lbl(self.selected[0])}"), view=self)
 
     async def _cb_l5(self, i):
-        self.selected = self.all_chapters[:5]; self._rebuild()
+        self.selected = list(self.all_chapters[:5]); self._rebuild()
         await i.response.edit_message(embed=self.build_embed("📦  آخر 5 فصول"), view=self)
+
+    async def _cb_l10(self, i):
+        self.selected = list(self.all_chapters[:10]); self._rebuild()
+        await i.response.edit_message(embed=self.build_embed("🔟  آخر 10 فصول"), view=self)
 
     async def _cb_pg(self, i):
         pg  = set(self.page_chs)
         oth = {n for n in self.selected if n not in pg}
-        self.selected = sorted(oth | pg, reverse=True); self._rebuild()
+        self.selected = sorted(oth | pg, reverse=self.sort_desc); self._rebuild()
         await i.response.edit_message(
             embed=self.build_embed(f"📄  أُضيفت كل فصول الصفحة ({len(self.page_chs)})"), view=self)
 
+    async def _cb_sort(self, i):
+        self.sort_desc = not self.sort_desc
+        self._apply_sort()
+        # إعادة ترتيب المحدود بنفس الاتجاه
+        self.selected = sorted(self.selected, reverse=self.sort_desc)
+        self.page     = 0
+        self._rebuild()
+        lbl = "تنازلي (أحدث أولاً)" if self.sort_desc else "تصاعدي (أقدم أولاً)"
+        await i.response.edit_message(
+            embed=self.build_embed(f"🔀  الترتيب: {lbl}"), view=self)
+
     async def _cb_range(self, i):
         await i.response.send_modal(RangeModal(self))
+
+    async def _cb_settings(self, i):
+        if not self.stitch_enabled:
+            return await i.response.send_message(
+                "⚠️  تفعّل وضع SmartStitch أولاً لتغيير الإعدادات.", ephemeral=True)
+        await i.response.send_modal(StitchSettingsModal(self))
+
+    async def _cb_mode(self, i):
+        self.stitch_enabled = not self.stitch_enabled
+        mode = "SmartStitch ✓" if self.stitch_enabled else "ZIP فقط (بلا دمج)"
+        self._rebuild()
+        await i.response.edit_message(
+            embed=self.build_embed(f"⚡  الوضع: {mode}"), view=self)
 
     async def _cb_clear(self, i):
         self.selected = []; self.ch_status = {}; self._rebuild()
@@ -401,39 +558,72 @@ class MangaPanelView(ui.View):
             embed=self.build_embed("✖  اللوحة مغلقة", color=C_GREY), view=self)
         self.stop()
 
+    async def _cb_retry(self, i):
+        """إعادة المحاولة للفصول الفاشلة."""
+        failed = [n for n, v in self.ch_status.items() if v.get("state") == "failed"]
+        if not failed:
+            return await i.response.send_message("لا توجد فصول فاشلة.", ephemeral=True)
+        # أعد تعيين الفاشلة لـ queued
+        for n in failed:
+            self.ch_status[n] = {"state": "queued"}
+        # ضعها في المحدد
+        self.selected = sorted(
+            set(self.selected) | set(failed), reverse=self.sort_desc
+        )
+        self._rebuild()
+        await i.response.edit_message(
+            embed=self.build_embed(f"🔄  إعادة {len(failed)} فصل فاشل..."), view=self)
+        # ابدأ التحميل
+        await self._run_downloads(i.message, failed)
+
     # ── start download ─────────────────────────────────────────────────────
     async def _cb_start(self, interaction: discord.Interaction):
         if self.running:
             return await interaction.response.send_message("⚠️ عملية جارية.", ephemeral=True)
         if not self.selected:
             return await interaction.response.send_message(
-                "❗ اختر فصولاً أولاً.\nاستخدم القائمة أو ✏️ نطاق أو أزرار الاختيار السريع.",
-                ephemeral=True,
-            )
+                "❗ اختر فصولاً أولاً.", ephemeral=True)
 
-        self.running   = True
-        to_dl          = sorted(self.selected)
-        self.ch_status = {n: {"state": "queued"} for n in to_dl}
+        to_dl = sorted(self.selected, reverse=self.sort_desc)
+        for n in to_dl:
+            if self.ch_status.get(n, {}).get("state") != "done":
+                self.ch_status[n] = {"state": "queued"}
+
+        self.running = True
         self._rebuild()
-
         await interaction.response.edit_message(
             embed=self.build_embed(
-                f"Starting {len(to_dl)} chapters  ·  "
-                f"Ch.{_lbl(to_dl[0])} → Ch.{_lbl(to_dl[-1])}",
+                f"🚀 بدء تحميل {len(to_dl)} فصل  ·  توازي×{DL_CONCURRENT}",
                 color=C_RUN,
             ),
             view=self,
         )
-        panel_msg = interaction.message
+        await self._run_downloads(interaction.message, to_dl)
 
-        for num in to_dl:
-            url   = self.chapters_dict[num]
-            lbl   = _lbl(num)
-            self.ch_status[num] = {"state": "downloading", "progress": 0}
-            last_edit = 0.0
+    # ── منطق التحميل المتوازي ─────────────────────────────────────────────
+    async def _run_downloads(self, panel_msg: discord.Message, to_dl: list):
+        self.running  = True
+        sem           = asyncio.Semaphore(DL_CONCURRENT)
+        last_edit_ts  = 0.0
+        edit_lock     = asyncio.Lock()
+
+        async def _safe_edit(note=None, col=None):
+            nonlocal last_edit_ts
+            async with edit_lock:
+                now = asyncio.get_running_loop().time()
+                if now - last_edit_ts < 1.8:
+                    return
+                last_edit_ts = now
+                try:
+                    await panel_msg.edit(embed=self.build_embed(note, color=col))
+                except Exception:
+                    pass
+
+        async def _dl_one(num: float):
+            url = self.chapters_dict[num]
+            lbl = _lbl(num)
 
             async def pcb(cur, tot, txt, _n=num, _l=lbl):
-                nonlocal last_edit
                 pct   = min(100, int(cur * 100 / max(tot, 1)))
                 state = "downloading"
                 if any(k in txt for k in ("SmartStitch", "دمج", "🪡", "stitch")):
@@ -445,75 +635,77 @@ class MangaPanelView(ui.View):
                 self.ch_status[_n].update(
                     {"state": state, "progress": pct, "provider": prov}
                 )
-                now = asyncio.get_running_loop().time()
-                if now - last_edit < 2.0 and pct < 100:
-                    return
-                last_edit = now
-                try:
-                    await panel_msg.edit(embed=self.build_embed(f"Ch.{_l}  {txt}"))
-                except Exception:
-                    pass
+                await _safe_edit(f"Ch.{_l}  {txt}")
 
             fp = None
-            try:
-                fp = await self.downloader.download_and_stitch(
-                    url, f"Ch_{lbl}", progress_callback=pcb
-                )
-                if not fp:
-                    self.ch_status[num] = {"state": "failed", "detail": "فشل جلب الصور"}
-                    await panel_msg.edit(embed=self.build_embed(f"Ch.{lbl}  ─  فشل التحميل"))
-                    continue
+            async with sem:
+                if self.ch_status.get(num, {}).get("state") == "done":
+                    return
+                self.ch_status[num] = {"state": "downloading", "progress": 0}
+                await _safe_edit(f"↓ Ch.{lbl}  بدأ التحميل...")
 
-                link = prov = None
-                for pname, pfn in [
-                    ("Gofile", lambda f: self.downloader.upload_to_gofile(f, progress_callback=pcb)),
-                    ("Catbox", lambda f: self.downloader.upload_to_catbox(f, progress_callback=pcb)),
-                ]:
-                    self.ch_status[num].update(
-                        {"state": "uploading", "provider": pname, "progress": 0}
-                    )
-                    await panel_msg.edit(
-                        embed=self.build_embed(f"Ch.{lbl}  →  {pname}  uploading...")
-                    )
-                    link = await pfn(fp)
+                try:
+                    if self.stitch_enabled:
+                        fp = await self.downloader.download_and_stitch(
+                            url, f"Ch_{lbl}",
+                            target_height=self.stitch_height,
+                            target_width=self.stitch_width,
+                            sensitivity=self.stitch_sensitivity,
+                            progress_callback=pcb,
+                        )
+                    else:
+                        fp = await self.downloader.download_chapter(
+                            url, f"Ch_{lbl}", progress_callback=pcb,
+                        )
+
+                    if not fp:
+                        self.ch_status[num] = {"state": "failed", "detail": "فشل جلب الصور"}
+                        await _safe_edit(f"✗ Ch.{lbl}  فشل التحميل", col=C_FAIL)
+                        return
+
+                    link = prov = None
+                    for pname, pfn in [
+                        ("Gofile", lambda f: self.downloader.upload_to_gofile(f, progress_callback=pcb)),
+                        ("Catbox", lambda f: self.downloader.upload_to_catbox(f, progress_callback=pcb)),
+                    ]:
+                        self.ch_status[num].update(
+                            {"state": "uploading", "provider": pname, "progress": 0}
+                        )
+                        await _safe_edit(f"↑ Ch.{lbl}  رفع → {pname}...")
+                        link = await pfn(fp)
+                        if link:
+                            prov = pname
+                            break
+
                     if link:
-                        prov = pname
-                        break
+                        self.ch_status[num] = {
+                            "state": "done", "progress": 100,
+                            "provider": prov, "link": link,
+                        }
+                        await _safe_edit(f"✓ Ch.{lbl}  {prov}", col=C_DONE)
+                    else:
+                        self.ch_status[num] = {
+                            "state": "failed", "detail": "Gofile & Catbox failed"
+                        }
+                        await _safe_edit(f"✗ Ch.{lbl}  رفع فاشل", col=C_FAIL)
 
-                if link:
-                    self.ch_status[num] = {
-                        "state": "done", "progress": 100,
-                        "provider": prov, "link": link,
-                    }
-                    await panel_msg.edit(
-                        embed=self.build_embed(f"Ch.{lbl}  ✓  {prov}", color=C_DONE)
-                    )
-                else:
-                    self.ch_status[num] = {
-                        "state": "failed", "detail": "Gofile & Catbox failed"
-                    }
-                    await panel_msg.edit(
-                        embed=self.build_embed(f"Ch.{lbl}  ✗  رفع فاشل", color=C_FAIL)
-                    )
+                except Exception as e:
+                    self.ch_status[num] = {"state": "failed", "detail": str(e)[:80]}
+                    await _safe_edit(f"✗ Ch.{lbl}  خطأ: {e}", col=C_FAIL)
+                finally:
+                    if fp:
+                        self.downloader.cleanup(fp)
 
-            except Exception as e:
-                self.ch_status[num] = {"state": "failed", "detail": str(e)[:80]}
-                await panel_msg.edit(
-                    embed=self.build_embed(f"Ch.{lbl}  ✗  Error", color=C_FAIL)
-                )
-            finally:
-                if fp:
-                    self.downloader.cleanup(fp)
-            await asyncio.sleep(0.5)
+        await asyncio.gather(*[_dl_one(n) for n in to_dl])
 
         # ── انتهى التحميل ──────────────────────────────────────────────────
         self.running = False
         done_list = [
-            (n, self.ch_status[n]) for n in sorted(self.selected)
+            (n, self.ch_status[n]) for n in sorted(to_dl)
             if self.ch_status.get(n, {}).get("state") == "done"
         ]
         fail_list = [
-            n for n in sorted(self.selected)
+            n for n in sorted(to_dl)
             if self.ch_status.get(n, {}).get("state") == "failed"
         ]
         fc = C_DONE if not fail_list else (C_FAIL if not done_list else C_RUN)
@@ -526,42 +718,31 @@ class MangaPanelView(ui.View):
             view=self,
         )
 
-        # ── منشن واحد في الآخر ────────────────────────────────────────────
         if done_list:
             mention = self.requester.mention if self.requester else ""
             series  = _series_name(self.series_url)
-
             summary = discord.Embed(
                 title="📦  Download Complete",
-                color=C_DONE,
+                color=fc,
                 timestamp=datetime.datetime.now(datetime.timezone.utc),
             )
-            status_note = (
-                f"✓  {len(done_list)} chapters ready"
-                + (f"  ·  ✗  {len(fail_list)} failed" if fail_list else "")
-            )
-            failed_txt = (
-                "\n**Failed:** " + ", ".join(f"Ch.{_lbl(n)}" for n in fail_list)
-                if fail_list else ""
-            )
+            mode_used = "SmartStitch" if self.stitch_enabled else "ZIP only"
             summary.description = (
                 f"```yaml\n"
                 f"  Series  : {series}\n"
-                f"  Status  : {status_note}\n"
+                f"  Mode    : {mode_used}\n"
+                f"  Done    : {len(done_list)}"
+                + (f"  │  Failed: {len(fail_list)}" if fail_list else "") + "\n"
                 f"  Site    : {_domain(self.series_url)}\n"
                 f"```"
-                + failed_txt
+                + ("\n**Failed:** " + ", ".join(f"Ch.{_lbl(n)}" for n in fail_list)
+                   if fail_list else "")
             )
-
             links_txt = "\n".join(
                 f"[**Ch.{_lbl(n)}**  ─  {d.get('provider','')}]({d['link']})"
                 for n, d in done_list
             )
-            summary.add_field(
-                name="🔗  Download Links",
-                value=links_txt[:1020],
-                inline=False,
-            )
+            summary.add_field(name="🔗  Download Links", value=links_txt[:1020], inline=False)
             summary.set_footer(text="Cat-Bi  ·  Manga System")
             await panel_msg.channel.send(content=mention, embed=summary)
 
@@ -901,7 +1082,7 @@ class RadarCog(commands.Cog):
             em = view.build_embed(
                 f"Fetched {len(chs)} chapters  ·  "
                 f"Ch.{_lbl(min(chs))} → Ch.{_lbl(max(chs))}  ·  "
-                f"Browse pages, select chapters, press Launch"
+                f"Browse pages, select chapters, press 🚀"
             )
             await interaction.edit_original_response(content=None, embed=em, view=view)
         except Exception as e:
