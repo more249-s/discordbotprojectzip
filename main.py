@@ -41,6 +41,9 @@ binance_mon  = BinanceMonitor(bot)
 downloader   = MangaDownloader()
 provider_mgr = ProviderManager()
 
+# Cache for user registration to avoid DB hits on every message
+registered_cache = set()
+
 
 async def setup_hook():
     await database.init_db()
@@ -68,6 +71,13 @@ async def on_ready():
 @bot.event
 async def on_message(message):
     if message.author.bot:
+        return
+
+    # التسجيل التلقائي عند أول رسالة
+    if message.author.id not in registered_cache:
+        await get_rank(message.author.id, auto_register=True)
+        registered_cache.add(message.author.id)
+
         return
 
     is_gemini_ch  = message.channel.id == Config.GEMINI_CHANNEL_ID
@@ -294,43 +304,45 @@ async def price_cmd(interaction: discord.Interaction, symbol: str):
         ))
 
 
-@bot.tree.command(name="search", description="ابحث عن مانجا بالاسم")
-@app_commands.describe(query="اسم المانجا أو الكلمة المفتاحية")
+@bot.tree.command(name="search", description="Search for manga and open the control panel")
+@app_commands.describe(query="Manga name or keyword")
 @user_only()
 async def search_manga(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
-    results = await provider_mgr.search_manga(query, limit=8)
+    results = await provider_mgr.search_manga(query, limit=10)
     if not results:
         return await interaction.followup.send(embed=discord.Embed(
-            title="🔍 لا نتائج",
-            description=f"لم يُعثر على نتائج لـ `{query}`.",
+            title="🔍 No Results",
+            description=f"No manga found for `{query}`.",
             color=C_RED,
         ))
 
     em = discord.Embed(
-        title=f"🔍 نتائج البحث: {query}",
+        title=f"🔍 Search Results: {query}",
+        description="Choose a manga to open its control panel:",
         color=C_BLUE,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
-    em.set_footer(text="المصدر: MangaDex • Cat-Bi")
+
+    class SearchDropdown(discord.ui.Select):
+        def __init__(self, items):
+            options = [
+                discord.SelectOption(label=r['title'][:100], description=f"Status: {r['status']}", value=r['url'], emoji="📖")
+                for r in items
+            ]
+            super().__init__(placeholder="Choose a manga...", options=options)
+
+        async def callback(self, i: discord.Interaction):
+            await i.response.defer()
+            # استدعاء manga_panel_cmd من radar
+            radar_cog = bot.get_cog("RadarCog")
+            if radar_cog:
+                await radar_cog.manga_panel_cmd(i, self.values[0])
+            else:
+                await i.followup.send("Radar module not found.", ephemeral=True)
 
     view = discord.ui.View()
-    for i, r in enumerate(results[:8]):
-        icon  = {"ongoing": "🟢", "completed": "✅", "hiatus": "🟡",
-                 "cancelled": "🔴"}.get(r["status"], "⚪")
-        desc_ = r["description"][:120] + "..." if len(r["description"]) > 120 else r["description"]
-        em.add_field(
-            name=f"{i+1}. {r['title']} {icon}",
-            value=f"{desc_}\n[📖 اقرأ الآن]({r['url']})" if desc_ else f"[📖 اقرأ الآن]({r['url']})",
-            inline=False,
-        )
-        if i < 5:
-            view.add_item(discord.ui.Button(
-                label=f"{i+1}. {r['title'][:40]}",
-                style=discord.ButtonStyle.link,
-                url=r["url"],
-                row=i // 2,
-            ))
+    view.add_item(SearchDropdown(results))
 
     if results[0].get("cover"):
         em.set_thumbnail(url=results[0]["cover"])
@@ -438,8 +450,8 @@ async def balance_cmd(interaction: discord.Interaction):
 # ═════════════════════════════════════════════════════════════════════════════
 #  أوامر المانجا — VIP+
 # ═════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="download", description="تحميل فصل مانجا مع SmartStitch")
-@app_commands.describe(url="رابط الفصل", title="اسم الملف (اختياري)")
+@bot.tree.command(name="download_direct", description="Directly download a chapter via link")
+@app_commands.describe(url="Chapter URL", title="Filename (Optional)")
 @vip_only()
 async def download_cmd(interaction: discord.Interaction,
                        url: str, title: str = "Manga_Chapter"):
