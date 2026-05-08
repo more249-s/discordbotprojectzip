@@ -289,6 +289,125 @@ class ProviderManager:
         p = self.get_provider(url)
         return type(p).__name__.replace("Provider", "")
 
+    async def get_series_cover(self, url: str) -> str | None:
+        """محاولة جلب صورة غلاف العمل من الصفحة الرئيسية."""
+        import aiohttp, re
+        from bs4 import BeautifulSoup
+
+        # MangaDex — API مباشر
+        if "mangadex.org" in url:
+            try:
+                m = re.search(r'mangadex\.org/title/([a-z0-9-]+)', url)
+                if m:
+                    mid = m.group(1)
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(
+                            f"https://api.mangadex.org/manga/{mid}?includes[]=cover_art",
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        ) as r:
+                            if r.status == 200:
+                                data = await r.json()
+                                for rel in data.get("data", {}).get("relationships", []):
+                                    if rel["type"] == "cover_art":
+                                        fn = rel.get("attributes", {}).get("fileName", "")
+                                        if fn:
+                                            return f"https://uploads.mangadex.org/covers/{mid}/{fn}.512.jpg"
+            except Exception:
+                pass
+
+        # Comick — API
+        if any(x in url for x in ["comick.fun", "comick.io", "comick.cc"]):
+            try:
+                slug = url.rstrip("/").split("/")[-1]
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        f"https://api.comick.fun/comic/{slug}",
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as r:
+                        if r.status == 200:
+                            d = await r.json()
+                            cover = d.get("comic", {}).get("md_covers", [{}])[0].get("b2key", "")
+                            if cover:
+                                return f"https://meo.comick.pictures/{cover}"
+            except Exception:
+                pass
+
+        # طريقة عامة: og:image من HTML
+        loop = asyncio.get_event_loop()
+        def _scrape():
+            try:
+                html = self.generic.fetch_html(url)
+                if not html:
+                    return None
+                soup = BeautifulSoup(html, "html.parser")
+                # og:image
+                og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name":"og:image"})
+                if og and og.get("content", "").startswith("http"):
+                    return og["content"]
+                # twitter:image
+                tw = soup.find("meta", attrs={"name": "twitter:image"})
+                if tw and tw.get("content", "").startswith("http"):
+                    return tw["content"]
+                # img.cover أو img في العنوان
+                for sel in ["img.img-cover", ".summary_image img", ".thumb img",
+                            ".series-thumb img", ".manga-cover img", "img.cover"]:
+                    el = soup.select_one(sel)
+                    if el:
+                        src = el.get("src") or el.get("data-src") or el.get("data-lazy-src", "")
+                        if src.startswith("http"):
+                            return src
+            except Exception:
+                pass
+            return None
+        return await loop.run_in_executor(None, _scrape)
+
+    async def get_chapters_with_lock_info(self, url: str) -> dict:
+        """
+        إرجاع قاموس الفصول مع معلومات الإقفال:
+        { chapter_num: {"url": "...", "locked": False} }
+        """
+        provider  = self.get_provider(url)
+        pname     = type(provider).__name__
+
+        # مزودات تدعم معلومات الإقفال
+        if "Bilibili" in pname:
+            try:
+                import aiohttp, re, json as _json
+                comic_id = provider._extract_comic_id(url)
+                if comic_id:
+                    headers = provider.HEADERS
+                    async with aiohttp.ClientSession(headers=headers) as s:
+                        async with s.post(
+                            f"{provider.API}/ComicDetail",
+                            json={"comic_id": int(comic_id)},
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as r:
+                            if r.status == 200:
+                                data = await r.json()
+                    if data.get("code") == 0:
+                        result = {}
+                        for ep in data.get("data", {}).get("ep_list", []):
+                            ep_id  = ep.get("id")
+                            ord_   = ep.get("ord")
+                            locked = ep.get("is_locked", True)
+                            if ep_id and ord_:
+                                try:
+                                    num = float(ord_)
+                                    result[num] = {
+                                        "url":    f"https://manga.bilibili.com/mc{comic_id}/{ep_id}",
+                                        "locked": locked,
+                                    }
+                                except Exception:
+                                    pass
+                        return result
+            except Exception:
+                pass
+
+        # fallback: جلب عادي بدون معلومات إقفال
+        chapters = await self.get_all_chapters(url)
+        return {num: {"url": ch_url, "locked": False}
+                for num, ch_url in chapters.items()}
+
     async def search_manga(self, query: str, limit: int = 10) -> list:
         """بحث عن مانجا بالاسم عبر MangaDex API"""
         try:

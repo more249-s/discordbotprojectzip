@@ -8,6 +8,7 @@ import os
 from typing import Optional
 import database
 from manga_downloader import MangaDownloader
+from user_system import owner_only, vip_only, get_rank
 
 RADAR_CONCURRENT  = 5
 CHAPTERS_PER_PAGE = 20
@@ -180,7 +181,9 @@ class MangaPanelView(ui.View):
     def __init__(self, bot, downloader, provider_manager,
                  series_url, chapters_dict,
                  requester: discord.User = None,
-                 provider_name: str = "Generic"):
+                 provider_name: str = "Generic",
+                 cover_url: str = None,
+                 locked_chapters: set = None):
         super().__init__(timeout=1800)
         self.bot              = bot
         self.downloader       = downloader
@@ -188,6 +191,8 @@ class MangaPanelView(ui.View):
         self.series_url       = series_url
         self.requester        = requester
         self.provider_name    = provider_name
+        self.cover_url        = cover_url
+        self.locked_chapters  = locked_chapters or set()
 
         self.all_chapters : list[float] = sorted(chapters_dict.keys(), reverse=True)
         self.chapters_dict              = chapters_dict
@@ -237,20 +242,27 @@ class MangaPanelView(ui.View):
 
         # ── صف 0: select menu ─────────────────────────────────────────────
         if chs:
-            opts = [
-                discord.SelectOption(
-                    label=f"Ch.{_lbl(n):>6}",
+            opts = []
+            for n in chs:
+                state    = self.ch_status.get(n, {}).get("state", "")
+                is_done  = state == "done"
+                in_sel   = n in sel_s
+                is_locked = n in self.locked_chapters
+                if is_done:
+                    emoji = "✅"; desc = "✓ مكتمل"
+                elif in_sel:
+                    emoji = "🔵"; desc = "محدد للتحميل"
+                elif is_locked:
+                    emoji = "🔒"; desc = "مدفوع / مقفل"
+                else:
+                    emoji = "▫️"; desc = "اضغط للإضافة"
+                opts.append(discord.SelectOption(
+                    label=f"{'🔒 ' if is_locked else ''}Ch.{_lbl(n):>6}",
                     value=str(n),
-                    emoji=("✅" if self.ch_status.get(n, {}).get("state") == "done"
-                           else ("🔵" if n in sel_s else "▫️")),
-                    description=(
-                        "✓ مكتمل" if self.ch_status.get(n, {}).get("state") == "done"
-                        else ("محدد للتحميل" if n in sel_s else "اضغط للإضافة")
-                    ),
-                    default=(n in sel_s),
-                )
-                for n in chs
-            ]
+                    emoji=emoji,
+                    description=desc,
+                    default=in_sel,
+                ))
             menu = ui.Select(
                 placeholder=f"📖  الصفحة {self.page+1}/{self.total_pages}  —  اختر فصولاً",
                 min_values=1, max_values=len(opts),
@@ -342,23 +354,31 @@ class MangaPanelView(ui.View):
         total  = len(self.all_chapters)
         selcnt = len(self.selected)
         pct_s  = int(selcnt / max(total, 1) * 100)
+        locked = len(self.locked_chapters)
 
         state_icon = "⚙️" if self.running else "📚"
         em = discord.Embed(
             title=f"{state_icon}  {series}",
+            url=self.series_url,
             color=color,
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
 
+        # صورة الغلاف
+        if self.cover_url:
+            em.set_thumbnail(url=self.cover_url)
+
         mode_txt   = "SmartStitch" if self.stitch_enabled else "ZIP فقط (سريع)"
         sort_txt   = "تنازلي (أحدث أولاً)" if self.sort_desc else "تصاعدي (أقدم أولاً)"
         status_txt = "● جاري التحميل" if self.running else "● جاهز"
+        lock_txt   = f"🔒 {locked} مدفوع" if locked else "🔓 كل مجاني"
         em.description = (
             f"```yaml\n"
             f"  Site     : {site}\n"
             f"  Provider : {self.provider_name}\n"
             f"  Mode     : {mode_txt}\n"
             f"  Sort     : {sort_txt}\n"
+            f"  Lock     : {lock_txt}\n"
             f"  Status   : {status_txt}\n"
             f"─────────────────────────────────────────\n"
             f"  Chapters : {total:<6}  Selected : {selcnt} ({pct_s}%)\n"
@@ -749,13 +769,6 @@ class MangaPanelView(ui.View):
         self.stop()
 
 
-# ─────────────────────────────────────────────────────────────────────────
-def is_admin():
-    async def predicate(i: discord.Interaction):
-        return i.user.guild_permissions.administrator
-    return app_commands.check(predicate)
-
-
 from providers.manager import ProviderManager
 
 
@@ -844,11 +857,11 @@ class RadarCog(commands.Cog):
         await asyncio.gather(*[check_one(r) for r in due])
 
     # ── أوامر ─────────────────────────────────────────────────────────────
-    @app_commands.command(name="track_add", description="[أدمن] إضافة عمل للرادار.")
+    @app_commands.command(name="track_add", description="[Owner] إضافة عمل للرادار.")
     @app_commands.describe(url="رابط العمل", channel="روم الإشعارات",
                            custom_message="رسالة مرفقة", interval_hours="فحص كل كم ساعة",
                            current_chapter="الفصل الحالي", auto_download="تحميل تلقائي")
-    @is_admin()
+    @owner_only()
     @app_commands.guild_only()
     async def track_add_cmd(self, interaction: discord.Interaction,
                             url: str, channel: discord.TextChannel,
@@ -873,8 +886,8 @@ class RadarCog(commands.Cog):
         )
         await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(name="track_list", description="[أدمن] الأعمال المتتبعة.")
-    @is_admin()
+    @app_commands.command(name="track_list", description="[Owner] الأعمال المتتبعة.")
+    @owner_only()
     @app_commands.guild_only()
     async def track_list_cmd(self, interaction: discord.Interaction):
         rows = [r for r in await database.get_all_trackers() if r[1] == interaction.guild_id]
@@ -891,9 +904,9 @@ class RadarCog(commands.Cog):
         em.description = desc[:3900]
         await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(name="track_remove", description="[أدمن] إزالة متتبع.")
+    @app_commands.command(name="track_remove", description="[Owner] إزالة متتبع.")
     @app_commands.describe(tracker_id="الـ ID من track_list")
-    @is_admin()
+    @owner_only()
     @app_commands.guild_only()
     async def track_remove_cmd(self, interaction: discord.Interaction, tracker_id: int):
         ok = await database.remove_tracker(tracker_id, interaction.guild_id)
@@ -904,9 +917,9 @@ class RadarCog(commands.Cog):
         )
         await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(name="download_chapter", description="تحميل فصل واحد برابط مباشر.")
+    @app_commands.command(name="download_chapter", description="[VIP] تحميل فصل واحد برابط مباشر.")
     @app_commands.describe(url="رابط الفصل")
-    @is_admin()
+    @vip_only()
     async def dl_chapter_cmd(self, interaction: discord.Interaction, url: str):
         await interaction.response.defer()
         msg = await interaction.followup.send("⏳  Preparing...")
@@ -944,9 +957,9 @@ class RadarCog(commands.Cog):
         except Exception as e:
             await msg.edit(content=f"❌  Error: {e}")
 
-    @app_commands.command(name="download_range", description="تحميل نطاق فصول — ضع {num} مكان رقم الفصل.")
+    @app_commands.command(name="download_range", description="[VIP] تحميل نطاق فصول — ضع {num} مكان رقم الفصل.")
     @app_commands.describe(base_url="رابط مع {num}", start_ch="أول فصل", end_ch="آخر فصل")
-    @is_admin()
+    @vip_only()
     async def dl_range_cmd(self, interaction: discord.Interaction,
                            base_url: str, start_ch: int, end_ch: int):
         if "{num}" not in base_url:
@@ -993,9 +1006,9 @@ class RadarCog(commands.Cog):
 
         await interaction.channel.send("```\n✓  Range complete\n```")
 
-    @app_commands.command(name="download_series", description="استخراج ذكي ثم تحميل نطاق.")
+    @app_commands.command(name="download_series", description="[VIP] استخراج ذكي ثم تحميل نطاق.")
     @app_commands.describe(series_url="رابط صفحة المانجا", start_ch="أول فصل", end_ch="آخر فصل")
-    @is_admin()
+    @vip_only()
     async def dl_series_cmd(self, interaction: discord.Interaction,
                             series_url: str, start_ch: float, end_ch: float):
         if end_ch < start_ch or (end_ch - start_ch) > 20:
@@ -1050,16 +1063,42 @@ class RadarCog(commands.Cog):
         await interaction.channel.send("```\n✓  Series range complete\n```")
 
     # ── manga_panel ────────────────────────────────────────────────────────
-    @app_commands.command(name="manga_panel", description="لوحة تحكم متكاملة لتصفح وتحميل الفصول.")
+    @app_commands.command(name="manga_panel", description="[VIP] لوحة تحكم متكاملة لتصفح وتحميل الفصول.")
     @app_commands.describe(url="الرابط الرئيسي للمانجا/المانهوا")
-    @is_admin()
+    @vip_only()
     async def manga_panel_cmd(self, interaction: discord.Interaction, url: str):
         await interaction.response.send_message(
-            f"```yaml\n  Fetching chapters...\n  Site : {_domain(url)}\n```"
+            f"```yaml\n"
+            f"  جاري جلب الفصول...\n"
+            f"  Site : {_domain(url)}\n"
+            f"  انتظر لحظة...\n"
+            f"```"
         )
         try:
             prov_name = self.provider_manager.get_provider_name(url)
-            chs       = await self.provider_manager.get_all_chapters(url)
+
+            # جلب الفصول + صورة الغلاف + معلومات الإقفال بالتوازي
+            chs_task    = self.provider_manager.get_chapters_with_lock_info(url)
+            cover_task  = self.provider_manager.get_series_cover(url)
+            chs_rich, cover_url = await asyncio.gather(chs_task, cover_task,
+                                                        return_exceptions=True)
+
+            if isinstance(chs_rich, Exception):
+                chs_rich = {}
+            if isinstance(cover_url, Exception):
+                cover_url = None
+
+            # فصل الـ URL عن معلومات الإقفال
+            chs        = {}
+            locked_set = set()
+            for num, info in chs_rich.items():
+                if isinstance(info, dict):
+                    chs[num] = info["url"]
+                    if info.get("locked"):
+                        locked_set.add(num)
+                else:
+                    chs[num] = info   # fallback: info هو URL مباشرة
+
             if not chs:
                 return await interaction.edit_original_response(
                     content=(
@@ -1067,8 +1106,8 @@ class RadarCog(commands.Cog):
                         f"  Status   : FAILED\n"
                         f"  Site     : {_domain(url)}\n"
                         f"  Provider : {prov_name}\n"
-                        f"  Error    : Could not extract chapters\n"
-                        f"             Check the URL or try again later\n"
+                        f"  Error    : لم يُعثر على فصول\n"
+                        f"             تحقق من الرابط أو حاول لاحقاً\n"
                         f"```"
                     )
                 )
@@ -1078,17 +1117,21 @@ class RadarCog(commands.Cog):
                 url, chs,
                 requester=interaction.user,
                 provider_name=prov_name,
+                cover_url=cover_url,
+                locked_chapters=locked_set,
             )
+            lock_info = f"  🔒 مدفوع: {len(locked_set)}" if locked_set else "  🔓 كل الفصول مجانية"
             em = view.build_embed(
-                f"Fetched {len(chs)} chapters  ·  "
-                f"Ch.{_lbl(min(chs))} → Ch.{_lbl(max(chs))}  ·  "
-                f"Browse pages, select chapters, press 🚀"
+                f"✅ وُجد {len(chs)} فصل  ·  "
+                f"Ch.{_lbl(min(chs))} → Ch.{_lbl(max(chs))}"
+                + (f"  ·  🔒 {len(locked_set)} مدفوع" if locked_set else "")
             )
             await interaction.edit_original_response(content=None, embed=em, view=view)
         except Exception as e:
             await interaction.edit_original_response(
                 content=f"```yaml\n  Status : ERROR\n  Detail : {e}\n```"
             )
+            import traceback; traceback.print_exc()
 
 
 async def setup(bot):
