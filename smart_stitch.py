@@ -228,7 +228,7 @@ def smart_stitch_to_files(
     saved = []
     for i, img in enumerate(slices):
         ext = output_format.lstrip(".")
-        filename = f"{chapter_name}_p{i+1:02d}.{ext}"
+        filename = f"{i+1:02d}.{ext}"
         filepath = os.path.join(output_dir, filename)
         if ext in ("jpg", "jpeg"):
             img.save(filepath, "JPEG", quality=output_quality)
