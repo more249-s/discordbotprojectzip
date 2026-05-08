@@ -122,6 +122,55 @@ class VortexProvider(BaseProvider):
             print(f"[VortexScans] get_all_chapters: {e}")
             return {}
 
+    async def get_chapters_with_lock_info(self, series_url: str) -> dict:
+        """جلب الفصول مع كشف الفصول المقفلة"""
+        try:
+            slug   = series_url.rstrip('/').split('/')[-1]
+            parsed = urlparse(series_url)
+            base   = f"{parsed.scheme}://{parsed.netloc}"
+
+            # محاولة جلب البيانات من الـ API لأنه غالباً يحتوي على حالة القفل
+            api_url = f"{base}/api/chapters?series={slug}&page=1&limit=9999"
+            data = self.fetch_json(api_url)
+
+            locked_nums = set()
+            all_chs = {}
+
+            if data and isinstance(data, dict):
+                # الهيكل المتوقع لـ Vortex هو list من الفصول
+                items = data.get('chapters', data.get('data', []))
+                if isinstance(items, dict): items = items.get('data', [])
+
+                for item in items:
+                    num = float(item.get('number', item.get('chapterNumber', 0)))
+                    is_locked = item.get('is_locked', item.get('locked', False))
+                    slug_ch = item.get('slug')
+                    if num and slug_ch:
+                        all_chs[num] = f"{series_url.rstrip('/')}/{slug_ch}"
+                        if is_locked:
+                            locked_nums.add(num)
+
+            if not all_chs:
+                all_chs = await self.get_all_chapters(series_url)
+
+            # فحص الـ HTML للأقفال إذا لم نجدها في الـ API
+            if not locked_nums:
+                html = self.fetch_html(series_url)
+                if html:
+                    soup = BeautifulSoup(html, 'html.parser')
+                    # البحث عن أيقونات القفل بجانب روابط الفصول
+                    for a in soup.find_all('a', href=True):
+                        if 'chapter' in a['href']:
+                            is_locked = bool(a.find(lambda t: t.name in ['svg', 'i'] and ('lock' in str(t).lower() or 'premium' in str(t).lower())))
+                            m = re.search(r'chapter[s]?[-/](\d+(?:\.\d+)?)', a['href'], re.I)
+                            if m and is_locked:
+                                locked_nums.add(float(m.group(1)))
+
+            return {n: {"url": u, "locked": n in locked_nums} for n, u in all_chs.items()}
+        except Exception:
+            chs = await self.get_all_chapters(series_url)
+            return {n: {"url": u, "locked": False} for n, u in chs.items()}
+
     async def _try_api(self, slug: str, series_url: str) -> dict:
         """يجرب عدة API endpoints شائعة في مواقع Next.js للمانجا"""
         parsed = urlparse(series_url)
@@ -135,6 +184,7 @@ class VortexProvider(BaseProvider):
             f"{base}/api/comic/{slug}/chapters",
             f"{base}/api/manga/{slug}/chapters?limit=9999",
             f"{base}/api/v1/comics/{slug}/chapters",
+            f"{base}/api/chapters?series_slug={slug}&page=1&limit=9999",
         ]
 
         for ep in endpoints:
@@ -142,40 +192,44 @@ class VortexProvider(BaseProvider):
                 data = self.fetch_json(ep)
                 if not data:
                     continue
+
+                # التعامل مع Vortex API الخاص
+                if isinstance(data, dict) and ('chapters' in data or 'data' in data):
+                    items = data.get('chapters', data.get('data', []))
+                    if isinstance(items, dict): items = items.get('data', [])
+                    for item in items:
+                        num = item.get('number') or item.get('chapterNumber')
+                        sl = item.get('slug')
+                        if num is not None and sl:
+                            chs[float(num)] = f"{series_url.rstrip('/')}/{sl}"
+                    if chs: return chs
+
                 text = json.dumps(data)
-                # استخراج روابط الفصول من JSON
                 found = self._chapters_from_json(text, base, series_url)
                 if found:
                     chs.update(found)
-                    # جرب الصفحات اللاحقة
-                    for page_n in range(2, 100):
+                    for page_n in range(2, 20):
                         ep2  = re.sub(r'page=\d+', f'page={page_n}', ep)
                         if ep2 == ep:
                             ep2 = ep + f"&page={page_n}" if '?' in ep else ep + f"?page={page_n}"
                         d2 = self.fetch_json(ep2)
-                        if not d2:
-                            break
+                        if not d2: break
                         new = self._chapters_from_json(json.dumps(d2), base, series_url)
-                        if not new:
-                            break
+                        if not new: break
                         before = len(chs)
                         chs.update(new)
-                        if len(chs) == before:
-                            break
-                    break  # وجدنا endpoint ناجح
+                        if len(chs) == before: break
+                    break
             except Exception:
                 continue
 
-        # ── جرب _next/data ───────────────────────────────────────────────
         if not chs:
             try:
-                # Next.js build ID من الصفحة
                 html = self.fetch_html(series_url)
                 if html:
                     m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html)
                     if m:
                         build_id = m.group(1)
-                        # مثال: /_next/data/{buildId}/series/{slug}.json
                         next_url = f"{base}/_next/data/{build_id}/series/{slug}.json"
                         data     = self.fetch_json(next_url)
                         if data:
