@@ -2,55 +2,46 @@ import re
 import json
 from bs4 import BeautifulSoup
 from .base_provider import BaseProvider
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 
 class MadaraProvider(BaseProvider):
     """
-    مزود عام لمواقع عائلة Madara WordPress + Next.js.
-    يغطي: utoon, qimanhwa, toonily, flamescans, reaperscans, وغيرها.
+    مزود عائلة Madara WordPress + Next.js.
+    يدعم: AJAX chapters، Pagination (?page=N / /page/N/)، و Next.js data.
     """
 
     def __init__(self, scraper=None):
         super().__init__(scraper)
 
+    # ── صور الفصل ─────────────────────────────────────────────────────────
     async def get_images(self, url: str):
         try:
             html = self.fetch_html(url, {'Referer': url})
             if not html:
                 return []
-
-            soup = BeautifulSoup(html, 'html.parser')
+            soup   = BeautifulSoup(html, 'html.parser')
             images = []
 
-            # 1. محاولة __NEXT_DATA__ (لمواقع Next.js)
-            next_data = soup.find('script', id='__NEXT_DATA__')
-            if next_data:
+            # 1. __NEXT_DATA__
+            nd = soup.find('script', id='__NEXT_DATA__')
+            if nd:
                 try:
-                    data = json.loads(next_data.string)
-                    text = json.dumps(data)
-                    images = self._extract_images_regex(text)
+                    images = self._regex_images(json.dumps(json.loads(nd.string)))
                     if images:
                         return images
                 except Exception:
                     pass
 
-            # 2. سلكتورات Madara الكلاسيكية
-            selectors = [
-                "div.reading-content img",
-                "div.page-break img",
-                "div#chapter-images img",
-                "div.wp-manga-chapter-img img",
-                "img.wp-manga-chapter-img",
-                "div[data-reader-page-image] img",
-                "div.chapter-images img",
-                "div.read-container img",
-                "div.viewer-images img",
-                "div#reader-images img",
-                "img[data-src]",
-            ]
-            for selector in selectors:
-                for img in soup.select(selector):
+            # 2. سلكتورات Madara
+            for sel in [
+                "div.reading-content img", "div.page-break img",
+                "div#chapter-images img", "div.wp-manga-chapter-img img",
+                "img.wp-manga-chapter-img", "div.chapter-images img",
+                "div.read-container img", "div.viewer-images img",
+                "div#reader-images img", "img[data-src]",
+            ]:
+                for img in soup.select(sel):
                     src = (img.get('data-src') or img.get('data-lazy-src') or
                            img.get('data-cfsrc') or img.get('src') or '').strip()
                     if not src:
@@ -59,144 +50,172 @@ class MadaraProvider(BaseProvider):
                         src = 'https:' + src
                     elif not src.startswith('http'):
                         src = urljoin(url, src)
-                    if src not in images and not any(x in src.lower() for x in ['logo', 'banner', 'ads', 'icon', 'avatar']):
+                    if src not in images and not any(
+                        x in src.lower() for x in ['logo', 'banner', 'ads', 'icon', 'avatar']
+                    ):
                         images.append(src)
                 if images:
                     return images
 
-            # 3. regex على كل الـ scripts
+            # 3. scripts regex
             for script in soup.find_all('script'):
                 content = script.string or ''
                 if any(x in content for x in ['.webp', '.jpg', '.jpeg', '.png']):
-                    found = self._extract_images_regex(content)
-                    for f in found:
+                    for f in self._regex_images(content):
                         if f not in images:
                             images.append(f)
                 if len(images) > 3:
                     return images
 
-            # 4. regex على كامل HTML
-            if not images:
-                images = self._extract_images_regex(html)
-
-            return images
+            return images or self._regex_images(html)
         except Exception as e:
-            print(f"[Madara] get_images error for {url}: {e}")
+            print(f"[Madara] get_images: {e}")
             return []
 
-    def _extract_images_regex(self, text: str) -> list:
+    def _regex_images(self, text: str) -> list:
         images = []
-        patterns = [
+        for pattern in [
             r'"src"\s*:\s*"(https?://[^"]+\.(?:webp|jpg|jpeg|png)[^"]*)"',
             r'"url"\s*:\s*"(https?://[^"]+\.(?:webp|jpg|jpeg|png)[^"]*)"',
             r'https?://[a-zA-Z0-9\-_.]+/[^"\'\s<>]+?\.(?:webp|jpg|jpeg|png)(?:\?[^"\'\s<>]*)?',
-        ]
-        for pattern in patterns:
-            for match in re.findall(pattern, text, re.IGNORECASE):
-                if isinstance(match, tuple):
-                    match = match[0]
-                cleaned = match.replace('\\u002F', '/').replace('\\', '').strip().rstrip('"')
-                if cleaned.startswith('http') and cleaned not in images:
-                    if not any(x in cleaned.lower() for x in ['logo', 'avatar', 'icon', 'banner', 'cover', 'ads']):
-                        images.append(cleaned)
+        ]:
+            for m in re.findall(pattern, text, re.IGNORECASE):
+                src = (m if isinstance(m, str) else m[0])
+                src = src.replace('\\u002F', '/').replace('\\', '').strip().rstrip('"')
+                if src.startswith('http') and src not in images:
+                    if not any(x in src.lower() for x in ['logo', 'avatar', 'icon', 'banner', 'cover', 'ads']):
+                        images.append(src)
         return images
 
+    # ── كل الفصول ─────────────────────────────────────────────────────────
     async def get_all_chapters(self, series_url: str) -> dict:
         try:
             html = self.fetch_html(series_url)
             if not html:
                 return {}
-
             soup = BeautifulSoup(html, 'html.parser')
 
-            # محاولة __NEXT_DATA__ أولاً
-            next_data = soup.find('script', id='__NEXT_DATA__')
-            if next_data:
+            # 1. Next.js data
+            nd = soup.find('script', id='__NEXT_DATA__')
+            if nd:
                 try:
-                    data = json.loads(next_data.string)
-                    chapters = self._extract_chapters_from_next(data, series_url)
-                    if chapters:
-                        return chapters
+                    chs = self._from_next(json.dumps(json.loads(nd.string)), series_url)
+                    if chs:
+                        return chs
                 except Exception:
                     pass
 
-            chapters = self._extract_chapters_from_html(soup, series_url)
+            # 2. HTML directo
+            chs = self._from_html(soup, series_url)
 
-            if not chapters:
-                chapters = await self._load_ajax_chapters(soup, series_url)
+            # 3. Madara AJAX (يجلب كل الفصول دفعة واحدة)
+            if not chs:
+                chs = await self._ajax_chapters(soup, series_url)
 
-            return chapters
+            # 4. Pagination — لو وجدنا فصولاً قليلة (< 30) جرب صفحات إضافية
+            if len(chs) < 30:
+                extra = self._paginate_chapters(
+                    series_url,
+                    lambda h, u: self._from_html(BeautifulSoup(h, 'html.parser'), u),
+                )
+                chs.update(extra)
+
+            return chs
         except Exception as e:
-            print(f"[Madara] get_all_chapters error: {e}")
+            print(f"[Madara] get_all_chapters: {e}")
             return {}
 
-    def _extract_chapters_from_next(self, data: dict, series_url: str) -> dict:
-        text = json.dumps(data)
-        chapters = {}
-        from urllib.parse import urlparse
+    def _from_next(self, text: str, series_url: str) -> dict:
+        chs    = {}
         parsed = urlparse(series_url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        for m in re.finditer(r'"((?:https?://[^"]+|/[^"]+)/(?:chapter[s]?|ch)[/-](\d+(?:\.\d+)?)(?:[/"\\]))'
-                             , text):
+        base   = f"{parsed.scheme}://{parsed.netloc}"
+        for m in re.finditer(
+            r'"((?:https?://[^"]+|/[^"]+)/(?:chapter[s]?|ch)[/-](\d+(?:\.\d+)?)(?:[/"\\]))', text
+        ):
             href = m.group(1).replace('\\u002F', '/').replace('\\', '')
-            num = float(m.group(2))
+            num  = float(m.group(2))
             if not href.startswith('http'):
                 href = urljoin(base, href)
-            chapters[num] = href
-        return chapters
+            chs[num] = href
+        return chs
 
-    def _extract_chapters_from_html(self, soup, series_url: str) -> dict:
-        chapters = {}
-        selectors = [
-            "li.wp-manga-chapter a",
-            "div#chapterlist li a",
-            "ul.main.version-chap li a",
-            "div.eph-num a",
-            "a[href*='/chapter']",
-            "a[href*='chapter-']",
-        ]
-        for selector in selectors:
-            for a in soup.select(selector):
+    def _from_html(self, soup, series_url: str) -> dict:
+        chs = {}
+        for sel in [
+            "li.wp-manga-chapter a", "div#chapterlist li a",
+            "ul.main.version-chap li a", "div.eph-num a",
+            "a[href*='/chapter']", "a[href*='chapter-']",
+        ]:
+            for a in soup.select(sel):
                 href = a.get('href', '').strip()
                 if not href:
                     continue
                 if not href.startswith('http'):
                     href = urljoin(series_url, href)
-                text = a.get_text().lower()
-                m = re.search(r'chapter\s*([\d.]+)', text) or re.search(r'(?:chapter[s]?|ch)[/-]([\d.]+)', href, re.I)
+                m = (re.search(r'chapter\s*([\d.]+)', a.get_text().lower())
+                     or re.search(r'(?:chapter[s]?|ch)[/-]([\d.]+)', href, re.I))
                 if m:
                     try:
-                        num = float(m.group(1))
-                        chapters[num] = href
+                        chs[float(m.group(1))] = href
                     except Exception:
                         pass
-            if chapters:
+            if chs:
                 break
-        return chapters
+        return chs
 
-    async def _load_ajax_chapters(self, soup, series_url: str) -> dict:
+    async def _ajax_chapters(self, soup, series_url: str) -> dict:
+        """
+        Madara AJAX: POST /wp-admin/admin-ajax.php
+        action=manga_get_chapters&manga={post_id}
+        بعض المواقع تُرجع كل الفصول مرة واحدة، بعضها يُرجع بالصفحات.
+        """
         try:
-            holder = soup.select_one("#manga-chapters-holder")
+            holder  = soup.select_one("#manga-chapters-holder")
             post_id = holder.get("data-id") if holder else None
             if not post_id:
                 m = re.search(r'manga_id\s*:\s*(\d+)', str(soup))
                 if m:
                     post_id = m.group(1)
-            if post_id:
-                base_url = "/".join(series_url.split("/")[:3])
-                ajax_url = f"{base_url}/wp-admin/admin-ajax.php"
-                resp = self.scraper.post(ajax_url, data={"action": "manga_get_chapters", "manga": post_id},
-                                         headers=self.headers, timeout=10)
-                if resp.status_code == 200:
+            if not post_id:
+                return {}
+
+            base     = "/".join(series_url.split("/")[:3])
+            ajax_url = f"{base}/wp-admin/admin-ajax.php"
+            all_chs  = {}
+
+            # بعض المواقع تدعم pagination في AJAX (paged=N)
+            for page_num in range(1, 100):
+                payload = {
+                    "action": "manga_get_chapters",
+                    "manga":  post_id,
+                    "paged":  str(page_num),
+                }
+                try:
+                    resp = self.scraper.post(ajax_url, data=payload,
+                                             headers=self.headers, timeout=15)
+                    if resp.status_code != 200 or not resp.text.strip() or resp.text.strip() in ("0", "false", ""):
+                        break
                     ajax_soup = BeautifulSoup(resp.text, 'html.parser')
-                    return self._extract_chapters_from_html(ajax_soup, series_url)
-        except Exception:
-            pass
-        return {}
+                    page_chs  = self._from_html(ajax_soup, series_url)
+                    if not page_chs:
+                        break
+                    before = len(all_chs)
+                    all_chs.update(page_chs)
+                    if len(all_chs) == before:
+                        break      # لا فصول جديدة = انتهى
+                    if page_num == 1 and len(page_chs) > 50:
+                        break      # صفحة واحدة كافية إذا أرجعت كثيراً
+                except Exception:
+                    break
+
+            return all_chs
+        except Exception as e:
+            print(f"[Madara] AJAX: {e}")
+            return {}
 
     def get_latest_chapter(self, url: str):
         import asyncio
-        loop = asyncio.new_event_loop()
+        loop   = asyncio.new_event_loop()
         result = loop.run_until_complete(self.get_all_chapters(url))
         loop.close()
         return max(result.keys()) if result else None
