@@ -364,19 +364,25 @@ class ProviderManager:
     async def get_chapters_with_lock_info(self, url: str) -> dict:
         """
         إرجاع قاموس الفصول مع معلومات الإقفال:
-        { chapter_num: {"url": "...", "locked": False} }
-        """
-        provider  = self.get_provider(url)
-        pname     = type(provider).__name__
+        { chapter_num: {"url": "...", "locked": bool, "reason": str} }
 
-        # مزودات تدعم معلومات الإقفال
+        الترتيب:
+        1. مزودات API مع lock info مدمج (Bilibili, Kakao...)
+        2. PaginatedScraper الجديد (يجمع lock info تلقائياً)
+        3. fallback: get_all_chapters بدون lock info
+        """
+        from .paginated_scraper import PaginatedScraper
+
+        provider = self.get_provider(url)
+        pname    = type(provider).__name__
+
+        # ── 1. Bilibili — API مع is_locked مدمج ──────────────────────
         if "Bilibili" in pname:
             try:
-                import aiohttp, re, json as _json
+                import aiohttp
                 comic_id = provider._extract_comic_id(url)
                 if comic_id:
-                    headers = provider.HEADERS
-                    async with aiohttp.ClientSession(headers=headers) as s:
+                    async with aiohttp.ClientSession(headers=provider.HEADERS) as s:
                         async with s.post(
                             f"{provider.API}/ComicDetail",
                             json={"comic_id": int(comic_id)},
@@ -392,21 +398,44 @@ class ProviderManager:
                             locked = ep.get("is_locked", True)
                             if ep_id and ord_:
                                 try:
-                                    num = float(ord_)
-                                    result[num] = {
+                                    result[float(ord_)] = {
                                         "url":    f"https://manga.bilibili.com/mc{comic_id}/{ep_id}",
                                         "locked": locked,
+                                        "reason": "bilibili-api",
                                     }
                                 except Exception:
                                     pass
-                        return result
-            except Exception:
-                pass
+                        if result:
+                            return result
+            except Exception as e:
+                print(f"[BilibiliLock] {e}")
 
-        # fallback: جلب عادي بدون معلومات إقفال
+        # ── 2. PaginatedScraper — يجمع lock info من HTML ──────────────
+        # يعمل مع الـ Generic provider ومواقع الـ pagination
+        if pname in ("Generic", "Madara", "Arabic", "MangaFire",
+                     "Bato", "Asura", "Vortex", "MangaPill",
+                     "Manganato", "WeebCentral"):
+            try:
+                scraper = PaginatedScraper(
+                    fetch_fn=self.generic.fetch_html,
+                    max_pages=50,
+                )
+                rich = await scraper.get_all_chapters(url, detect_lock=True)
+                if rich:
+                    print(f"[PaginatedScraper] {len(rich)} chapters from {url}")
+                    locked_cnt = sum(1 for v in rich.values() if v.get("locked"))
+                    if locked_cnt:
+                        print(f"[PaginatedScraper] 🔒 {locked_cnt} locked chapters")
+                    return rich
+            except Exception as e:
+                print(f"[PaginatedScraper] error: {e}")
+
+        # ── 3. fallback: get_all_chapters بدون lock info ───────────────
         chapters = await self.get_all_chapters(url)
-        return {num: {"url": ch_url, "locked": False}
-                for num, ch_url in chapters.items()}
+        return {
+            num: {"url": ch_url, "locked": False, "reason": "no-lock-data"}
+            for num, ch_url in chapters.items()
+        }
 
     async def search_manga(self, query: str, limit: int = 10) -> list:
         """بحث عن مانجا بالاسم عبر MangaDex API"""
