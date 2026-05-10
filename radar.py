@@ -322,62 +322,122 @@ class MangaPanelView(ui.View):
         )
         b_start.callback = self._cb_start; self.add_item(b_start)
 
-    # ── بناء الـ Embed ─────────────────────────────────────────────────────
+    # ── بناء الـ Embed (تصميم احترافي) ───────────────────────────────────
     def build_embed(self, note: str = None, color=None) -> discord.Embed:
-        color  = color or (C_RUN if self.running else C_IDLE)
+        color  = color or (C_RUN if self.running else discord.Color.from_rgb(99, 102, 241))
         series = _series_name(self.series_url)
         site   = _domain(self.series_url)
         selcnt = len(self.selected)
         total  = len(self.all_chapters)
 
-        em = discord.Embed(title=series, url=self.series_url, color=color)
-        if self.cover_url:
-            em.set_image(url=self.cover_url)
-
-        em.set_author(name="Manga Downloader", icon_url=self.bot.user.display_avatar.url)
-
-        desc = (
-            f"Please, choose not more than **25** chapters in one request.\n"
-            f"Click the button below and input the range of indexes you may need.\n"
-            f"*Important note: Index column **the left one**, always check the index of chapters you may need.*\n"
-            f"Example: «1-3, 10, 15-16» will download chapters with indexes 1,2,3,10,15,16.\n"
-            f"─────────────────────────────────────────"
+        # ── Header ────────────────────────────────────────────────────────
+        em = discord.Embed(
+            title=f"📖  {series}",
+            url=self.series_url,
+            color=color,
         )
-        em.description = desc
+        em.set_author(
+            name=f"Cat-Bi  ·  {self.provider_name}  ·  {site}",
+            icon_url=self.bot.user.display_avatar.url,
+        )
+        if self.cover_url:
+            em.set_thumbnail(url=self.cover_url)
 
-        # عرض الفصول بشكل مرتب
-        chs = self.page_chs
-        sel_s = set(self.selected)
-        ch_list = []
-        for n in chs:
-            is_locked = n in self.locked_chapters
-            in_sel    = n in sel_s
-            state     = self.ch_status.get(n, {}).get("state", "")
+        # ── Stats bar ─────────────────────────────────────────────────────
+        mode_ico  = "🧵" if self.stitch_enabled else "📦"
+        mode_txt  = "SmartStitch" if self.stitch_enabled else "ZIP Only"
+        sort_txt  = "⬆️ Oldest" if not self.sort_desc else "⬇️ Newest"
+        lock_txt  = f"  ·  🔒 {len(self.locked_chapters)}" if self.locked_chapters else ""
+        stats_bar = (
+            f"**{total}** chapters{lock_txt}  "
+            f"·  {mode_ico} `{mode_txt}`  "
+            f"·  {sort_txt}"
+        )
+        em.description = stats_bar
 
-            ico = ICO.get(state, ICO["selected"] if in_sel else (ICO["locked"] if is_locked else "[ ]"))
-            if ico == ICO["idle"]: ico = "[ ]"
+        # ── Chapter List ──────────────────────────────────────────────────
+        if not self.running:
+            chs   = self.page_chs
+            sel_s = set(self.selected)
+            rows  = []
+            for n in chs:
+                is_locked = n in self.locked_chapters
+                in_sel    = n in sel_s
+                state     = self.ch_status.get(n, {}).get("state", "")
 
-            idx = self.all_chapters.index(n) + 1
-            line = f"{ico} {idx}. Chapter {_lbl(n)}"
-            if is_locked: line += " 🔒"
-            ch_list.append(line)
+                # أيقونة الحالة
+                if state in ICO:
+                    ico = ICO[state]
+                elif in_sel:
+                    ico = "🟦"
+                elif is_locked:
+                    ico = "🔒"
+                else:
+                    ico = "◻️"
 
-        if ch_list:
-            em.add_field(name="Chapters", value=f"```\n{chr(10).join(ch_list)}\n```", inline=False)
+                idx  = self.all_chapters.index(n) + 1
+                lock = " 🔒" if is_locked and not in_sel else ""
+                done_link = self.ch_status.get(n, {}).get("link", "")
+                if done_link:
+                    rows.append(f"{ico} `{idx:>3}.` **[Ch.{_lbl(n)}]({done_link})**{lock}")
+                else:
+                    rows.append(f"{ico} `{idx:>3}.` Ch.{_lbl(n)}{lock}")
 
-        # ── download queue ─────────────────────────────────────────────────
+            if rows:
+                em.add_field(
+                    name=f"📋  Chapters  —  Page {self.page+1}/{self.total_pages}",
+                    value="\n".join(rows),
+                    inline=False,
+                )
+
+            # ── Selection Summary ──────────────────────────────────────────
+            if self.selected:
+                sel_nums   = sorted(self.selected)
+                done_ready = [n for n in sel_nums if self.ch_status.get(n, {}).get("state") == "done"]
+                failed     = [n for n in sel_nums if self.ch_status.get(n, {}).get("state") == "failed"]
+                pending    = [n for n in sel_nums if self.ch_status.get(n, {}).get("state") not in ("done","failed")]
+
+                summary_parts = [f"**{selcnt}** selected"]
+                if done_ready: summary_parts.append(f"✅ {len(done_ready)} ready")
+                if pending:    summary_parts.append(f"⏳ {len(pending)} pending")
+                if failed:     summary_parts.append(f"❌ {len(failed)} failed")
+                sel_range = f"Ch.{_lbl(min(sel_nums))} → Ch.{_lbl(max(sel_nums))}" if sel_nums else ""
+
+                em.add_field(
+                    name="✅  Selection",
+                    value=f"{' · '.join(summary_parts)}\n`{sel_range}`",
+                    inline=True,
+                )
+
+            # ── Settings ──────────────────────────────────────────────────
+            if self.stitch_enabled:
+                em.add_field(
+                    name="⚙️  SmartStitch",
+                    value=f"`{self.stitch_width}×{self.stitch_height}px`\nSensitivity: `{self.stitch_sensitivity}%`",
+                    inline=True,
+                )
+
+        # ── Download Queue (while running) ────────────────────────────────
         if self.running:
-            lines    = []
-            running_ = [n for n in self.selected
-                        if self.ch_status.get(n, {}).get("state") in
-                        ("downloading", "stitching", "uploading")]
-            queued_  = [n for n in self.selected
-                        if self.ch_status.get(n, {}).get("state") == "queued"]
-            done_n   = sum(1 for n in self.selected
-                           if self.ch_status.get(n, {}).get("state") == "done")
-            fail_n   = sum(1 for n in self.selected
-                           if self.ch_status.get(n, {}).get("state") == "failed")
+            running_ = [n for n in self.selected if self.ch_status.get(n, {}).get("state") in ("downloading","stitching","uploading")]
+            queued_  = [n for n in self.selected if self.ch_status.get(n, {}).get("state") == "queued"]
+            done_n   = sum(1 for n in self.selected if self.ch_status.get(n, {}).get("state") == "done")
+            fail_n   = sum(1 for n in self.selected if self.ch_status.get(n, {}).get("state") == "failed")
 
+            # Progress bar overall
+            total_dl = len(self.selected)
+            done_pct = int(done_n * 100 / total_dl) if total_dl else 0
+            overall_bar = pbar(done_pct, 14)
+
+            summary = (
+                f"⚡ **{len(running_)}** active  "
+                f"·  ⏳ {len(queued_)} queued  "
+                f"·  ✅ {done_n}  ·  ❌ {fail_n}\n"
+                f"`{overall_bar}`"
+            )
+            em.add_field(name="📊  Overall Progress", value=summary, inline=False)
+
+            lines = []
             for n in sorted(self.selected):
                 st    = self.ch_status.get(n, {})
                 state = st.get("state", "queued")
@@ -388,50 +448,39 @@ class MangaPanelView(ui.View):
                 lbl   = _lbl(n)
 
                 if state == "done":
-                    line = (f"`✅` **Ch.{lbl}**  ─  {prov}  [↗]({link})"
-                            if link else f"`✅` **Ch.{lbl}**")
+                    line = (f"✅ **Ch.{lbl}** — [{prov} ↗]({link})" if link else f"✅ **Ch.{lbl}**")
                 elif state == "failed":
-                    line = f"`❌` **Ch.{lbl}**  ─  {st.get('detail','فشل')[:35]}"
-                elif state in ("downloading", "uploading"):
-                    bar  = pbar(pct, 12)
-                    line = f"`{ico}` **Ch.{lbl}**  `{bar}`  {prov}"
+                    line = f"❌ **Ch.{lbl}** — {st.get('detail','Error')[:30]}"
                 elif state == "stitching":
-                    line = f"`🧵` **Ch.{lbl}**  SmartStitch..."
+                    line = f"🧵 **Ch.{lbl}** — SmartStitch..."
+                elif state in ("downloading", "uploading"):
+                    line = f"{ico} **Ch.{lbl}** `{pbar(pct,10)}` {prov}"
                 else:
-                    line = f"`⏳` **Ch.{lbl}**  Waiting..."
+                    line = f"⏳ **Ch.{lbl}** — Queued"
                 lines.append(line)
 
-            summary = (
-                f"⚡ **{len(running_)} Downloading**  "
-                f"│  ⏳ {len(queued_)} Queued  "
-                f"│  ✅ {done_n}  │  ❌ {fail_n}"
-            )
-            chunk = lines[:10]
-            if len(lines) > 10:
-                chunk.append(f"*... and {len(lines)-10} more*")
-            em.add_field(
-                name=f"⚡ Processing Queue",
-                value=summary + "\n" + "\n".join(chunk),
-                inline=False,
-            )
+            chunk = lines[:8]
+            if len(lines) > 8:
+                chunk.append(f"*… +{len(lines)-8} more chapters*")
+            em.add_field(name="📥  Queue Details", value="\n".join(chunk) or "—", inline=False)
 
-        # ── روابط جاهزة ───────────────────────────────────────────────────
-        ready = [
-            (n, self.ch_status[n])
-            for n in sorted(self.selected)
-            if self.ch_status.get(n, {}).get("state") == "done"
-            and self.ch_status[n].get("link")
-        ]
+        # ── Ready Links ───────────────────────────────────────────────────
+        ready = [(n, self.ch_status[n]) for n in sorted(self.selected)
+                 if self.ch_status.get(n, {}).get("state") == "done" and self.ch_status[n].get("link")]
         if ready and not self.running:
-            lnks = "  ·  ".join(
-                f"[Ch.{_lbl(n)}]({d['link']})" for n, d in ready[:10]
-            )
-            em.add_field(name="🔗 Ready Links", value=lnks, inline=False)
+            lnks = "\n".join(f"📎 [Ch.{_lbl(n)}  —  {d.get('provider','')}]({d['link']})" for n,d in ready[:8])
+            if len(ready) > 8:
+                lnks += f"\n*… +{len(ready)-8} more*"
+            em.add_field(name="🔗  Download Links", value=lnks, inline=False)
 
+        # ── Note ──────────────────────────────────────────────────────────
         if note:
-            em.add_field(name="Note", value=f"```fix\n{note}\n```", inline=False)
+            em.add_field(name="💬  Status", value=f"```fix\n{note}\n```", inline=False)
 
-        em.set_footer(text=f"Page {self.page+1}/{self.total_pages} | Selected: {selcnt}/{total} | {site}")
+        em.set_footer(
+            text=f"Page {self.page+1}/{self.total_pages}  ·  {selcnt}/{total} selected  ·  Cat-Bi Manga",
+            icon_url=self.bot.user.display_avatar.url,
+        )
         return em
 
     # ── navigation callbacks ──────────────────────────────────────────────

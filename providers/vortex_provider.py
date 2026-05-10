@@ -1,34 +1,92 @@
+"""
+vortex_provider.py — مزود VortexScans المحسّن
+
+يدعم:
+  • HTML links (أحدث 20 فصل)
+  • Chapter sitemaps (كل الفصول)
+  • Retry مع exponential backoff
+  • كشف الفصول المقفلة
+"""
+
+from __future__ import annotations
 import re
 import json
-from bs4 import BeautifulSoup
-from .base_provider import BaseProvider
+import time
+import asyncio
+from typing import Optional
 from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import cloudscraper
+from bs4 import BeautifulSoup
+
+from .base_provider import BaseProvider
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://vortexscans.org/",
+}
+
+_NUM_RE = re.compile(
+    r"(?:chapter|chap|ch)[-_/]?(\d+(?:\.\d+)?)", re.I
+)
 
 
 class VortexProvider(BaseProvider):
-    """مزود VortexScans — يدعم HTML + API + Pagination"""
+    """مزود VortexScans — HTML + Sitemaps + Retry"""
 
     BASE = "https://vortexscans.org"
 
     def __init__(self):
         super().__init__()
-        self.headers['Referer'] = self.BASE + '/'
+        self.scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        self.scraper.headers.update(HEADERS)
+
+    # ── Fetch مع Retry ─────────────────────────────────────────────────────
+    def _fetch_with_retry(self, url: str, retries: int = 3, timeout: int = 20) -> str | None:
+        for attempt in range(retries):
+            try:
+                r = self.scraper.get(url, headers=HEADERS, timeout=timeout)
+                if r.status_code == 200 and len(r.text) > 300:
+                    return r.text
+                if r.status_code in (403, 404):
+                    return None
+                if r.status_code in (429, 503, 504):
+                    wait = 2 ** attempt
+                    print(f"[Vortex] {r.status_code} on {url}, waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+            except Exception as e:
+                print(f"[Vortex] fetch attempt {attempt+1}: {e}")
+                if attempt < retries - 1:
+                    time.sleep(2)
+        return None
 
     # ── صور الفصل ─────────────────────────────────────────────────────────
-    async def get_images(self, url: str):
-        try:
-            html = self.fetch_html(url, {'Referer': self.BASE + '/'})
+    async def get_images(self, url: str) -> list[str]:
+        loop = asyncio.get_event_loop()
+
+        def _scrape():
+            html = self._fetch_with_retry(url)
             if not html:
                 return []
-            soup   = BeautifulSoup(html, 'html.parser')
+            soup   = BeautifulSoup(html, "html.parser")
             images = []
 
-            # 1. upload/series في img tags
-            for img in soup.find_all('img'):
-                src = (img.get('src') or img.get('data-src') or '').strip()
-                if 'upload/series' in src and src not in images:
-                    if 'wsrv.nl' in src:
-                        m = re.search(r'url=([^&]+)', src)
+            # 1. img tags with upload/series
+            for img in soup.find_all("img"):
+                src = (img.get("src") or img.get("data-src") or "").strip()
+                if "upload/series" in src and src not in images:
+                    if "wsrv.nl" in src:
+                        m = re.search(r"url=([^&]+)", src)
                         if m:
                             import urllib.parse
                             src = urllib.parse.unquote(m.group(1))
@@ -36,276 +94,159 @@ class VortexProvider(BaseProvider):
             if images:
                 return images
 
-            # 2. __NEXT_DATA__
-            nd = soup.find('script', id='__NEXT_DATA__')
-            if nd:
-                try:
-                    data = json.loads(nd.string)
-                    text = json.dumps(data)
-                    images = self._regex_images(text)
-                    if images:
-                        return images
-                except Exception:
-                    pass
-
-            # 3. regex على storage.vortexscans
+            # 2. regex direct
             for p in re.findall(
-                r'https?://storage\.vortexscans\.org/upload/series/[^"\'\s<>]+?\.(?:webp|jpg|jpeg|png)',
-                html, re.IGNORECASE
+                r"https?://(?:storage\.)?vortexscans\.org/upload/series/[^\"'\s<>]+?"
+                r"\.(?:webp|jpg|jpeg|png)",
+                html, re.I,
             ):
                 if p not in images:
                     images.append(p)
-            if images:
-                return images
-
-            # 4. أي img vortexscans
-            for img in soup.find_all('img'):
-                src = (img.get('src') or '').strip()
-                if 'vortexscans' in src and src not in images:
-                    if not any(x in src.lower() for x in ['logo', 'icon', 'avatar']):
-                        images.append(src)
             return images
-        except Exception as e:
-            print(f"[VortexScans] get_images: {e}")
-            return []
 
-    def _regex_images(self, text: str) -> list:
-        images = []
-        for pat in [
-            r'"src"\s*:\s*"(https?://[^"]+\.(?:webp|jpg|jpeg|png)[^"]*)"',
-            r'"url"\s*:\s*"(https?://[^"]+\.(?:webp|jpg|jpeg|png)[^"]*)"',
-        ]:
-            for m in re.findall(pat, text, re.IGNORECASE):
-                src = (m if isinstance(m, str) else m[0])
-                src = src.replace('\\u002F', '/').replace('\\', '').strip()
-                if src.startswith('http') and src not in images:
-                    if not any(x in src.lower() for x in ['logo', 'cover', 'avatar', 'banner']):
-                        images.append(src)
-        return images
+        return await loop.run_in_executor(None, _scrape)
 
     # ── كل الفصول ─────────────────────────────────────────────────────────
-    async def get_all_chapters(self, series_url: str) -> dict:
+    async def get_all_chapters(self, series_url: str) -> dict[float, str]:
+        rich = await self._get_chapters_rich(series_url)
+        return {num: info["url"] for num, info in rich.items()}
+
+    async def get_chapters_with_lock_info(self, series_url: str) -> dict[float, dict]:
+        return await self._get_chapters_rich(series_url)
+
+    async def _get_chapters_rich(self, series_url: str) -> dict[float, dict]:
+        loop = asyncio.get_event_loop()
+        slug = series_url.rstrip("/").split("/")[-1]
+
+        def _fetch_all():
+            all_chs: dict[float, dict] = {}
+
+            # ── 1. HTML links (يجلب أحدث 20 فصل دائماً) ─────────────────
+            html = self._fetch_with_retry(series_url, retries=3, timeout=25)
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+                chs  = self._from_html_links(soup, series_url)
+                all_chs.update(chs)
+                print(f"[Vortex] HTML links: {len(chs)} chapters")
+
+                # استخرج غلاف السلسلة للعرض
+                cover = soup.find("meta", property="og:image")
+                if cover:
+                    self._last_cover = cover.get("content", "")
+
+            # ── 2. Sitemaps (يجلب كل الفصول) ─────────────────────────────
+            sitemap_chs = self._fetch_sitemap_chapters(slug, series_url)
+            if sitemap_chs:
+                # أضف الفصول من السيتماب التي لم تُجلب من HTML
+                new = {k: v for k, v in sitemap_chs.items() if k not in all_chs}
+                all_chs.update(new)
+                print(f"[Vortex] Sitemaps: +{len(new)} new chapters (total from sitemap: {len(sitemap_chs)})")
+
+            return all_chs
+
+        result = await loop.run_in_executor(None, _fetch_all)
+        print(f"[Vortex] Total: {len(result)} chapters from {series_url}")
+        return result
+
+    def _fetch_sitemap_chapters(self, slug: str, series_url: str) -> dict[float, dict]:
+        """جلب كل فصول السلسلة من سيتماب VortexScans."""
+        all_chs: dict[float, dict] = {}
+
         try:
-            slug   = series_url.rstrip('/').split('/')[-1]
-            all_ch = {}
+            # جلب فهرس السيتماب
+            r = self.scraper.get(
+                f"{self.BASE}/sitemap.xml", headers=HEADERS, timeout=15
+            )
+            if r.status_code != 200:
+                return {}
 
-            # ── 1. API REST (أحدث sites غالباً بيكون عندها endpoint) ─────
-            api_chs = await self._try_api(slug, series_url)
-            all_ch.update(api_chs)
+            sitemap_urls = re.findall(
+                r"<loc>(https://vortexscans\.org/chapter-sitemap-\d+\.xml)</loc>",
+                r.text,
+            )
+            if not sitemap_urls:
+                return {}
 
-            # ── 2. __NEXT_DATA__ ──────────────────────────────────────────
-            if not all_ch:
-                html = self.fetch_html(series_url, {'Referer': self.BASE + '/'})
-                if html:
-                    soup = BeautifulSoup(html, 'html.parser')
-                    all_ch.update(self._from_next(soup, series_url))
-                    if not all_ch:
-                        all_ch.update(self._from_html(soup, series_url))
-            else:
-                # حتى مع API جرب HTML للتأكد من عدم وجود فصول إضافية
-                html = self.fetch_html(series_url, {'Referer': self.BASE + '/'})
-                if html:
-                    soup = BeautifulSoup(html, 'html.parser')
-                    all_ch.update(self._from_next(soup, series_url))
-                    all_ch.update(self._from_html(soup, series_url))
+            print(f"[Vortex] Found {len(sitemap_urls)} chapter sitemaps, scanning...")
 
-            # ── 3. Pagination إذا بدت الفصول قليلة ───────────────────────
-            if len(all_ch) < 30:
-                extra = self._paginate_chapters(
-                    series_url,
-                    self._extract_from_html_str,
-                )
-                all_ch.update(extra)
-
-            return all_ch
-        except Exception as e:
-            print(f"[VortexScans] get_all_chapters: {e}")
-            return {}
-
-    async def get_chapters_with_lock_info(self, series_url: str) -> dict:
-        """جلب الفصول مع كشف الفصول المقفلة"""
-        try:
-            slug   = series_url.rstrip('/').split('/')[-1]
-            parsed = urlparse(series_url)
-            base   = f"{parsed.scheme}://{parsed.netloc}"
-
-            # محاولة جلب البيانات من الـ API لأنه غالباً يحتوي على حالة القفل
-            api_url = f"{base}/api/chapters?series={slug}&page=1&limit=9999"
-            data = self.fetch_json(api_url)
-
-            locked_nums = set()
-            all_chs = {}
-
-            if data and isinstance(data, dict):
-                # الهيكل المتوقع لـ Vortex هو list من الفصول
-                items = data.get('chapters', data.get('data', []))
-                if isinstance(items, dict): items = items.get('data', [])
-
-                for item in items:
-                    num = float(item.get('number', item.get('chapterNumber', 0)))
-                    is_locked = item.get('is_locked', item.get('locked', False))
-                    slug_ch = item.get('slug')
-                    if num and slug_ch:
-                        all_chs[num] = f"{series_url.rstrip('/')}/{slug_ch}"
-                        if is_locked:
-                            locked_nums.add(num)
-
-            if not all_chs:
-                all_chs = await self.get_all_chapters(series_url)
-
-            # فحص الـ HTML للأقفال إذا لم نجدها في الـ API
-            if not locked_nums:
-                html = self.fetch_html(series_url)
-                if html:
-                    soup = BeautifulSoup(html, 'html.parser')
-                    # البحث عن أيقونات القفل بجانب روابط الفصول
-                    for a in soup.find_all('a', href=True):
-                        if 'chapter' in a['href']:
-                            is_locked = bool(a.find(lambda t: t.name in ['svg', 'i'] and ('lock' in str(t).lower() or 'premium' in str(t).lower())))
-                            m = re.search(r'chapter[s]?[-/](\d+(?:\.\d+)?)', a['href'], re.I)
-                            if m and is_locked:
-                                locked_nums.add(float(m.group(1)))
-
-            return {n: {"url": u, "locked": n in locked_nums} for n, u in all_chs.items()}
-        except Exception:
-            chs = await self.get_all_chapters(series_url)
-            return {n: {"url": u, "locked": False} for n, u in chs.items()}
-
-    async def _try_api(self, slug: str, series_url: str) -> dict:
-        """يجرب عدة API endpoints شائعة في مواقع Next.js للمانجا"""
-        parsed = urlparse(series_url)
-        base   = f"{parsed.scheme}://{parsed.netloc}"
-        chs    = {}
-
-        # أنماط API شائعة
-        endpoints = [
-            f"{base}/api/chapters?series={slug}&page=1&limit=9999",
-            f"{base}/api/series/{slug}/chapters",
-            f"{base}/api/comic/{slug}/chapters",
-            f"{base}/api/manga/{slug}/chapters?limit=9999",
-            f"{base}/api/v1/comics/{slug}/chapters",
-            f"{base}/api/chapters?series_slug={slug}&page=1&limit=9999",
-        ]
-
-        for ep in endpoints:
-            try:
-                data = self.fetch_json(ep)
-                if not data:
-                    continue
-
-                # التعامل مع Vortex API الخاص
-                if isinstance(data, dict) and ('chapters' in data or 'data' in data):
-                    items = data.get('chapters', data.get('data', []))
-                    if isinstance(items, dict): items = items.get('data', [])
-                    for item in items:
-                        num = item.get('number') or item.get('chapterNumber')
-                        sl = item.get('slug')
-                        if num is not None and sl:
-                            chs[float(num)] = f"{series_url.rstrip('/')}/{sl}"
-                    if chs: return chs
-
-                text = json.dumps(data)
-                found = self._chapters_from_json(text, base, series_url)
-                if found:
-                    chs.update(found)
-                    for page_n in range(2, 20):
-                        ep2  = re.sub(r'page=\d+', f'page={page_n}', ep)
-                        if ep2 == ep:
-                            ep2 = ep + f"&page={page_n}" if '?' in ep else ep + f"?page={page_n}"
-                        d2 = self.fetch_json(ep2)
-                        if not d2: break
-                        new = self._chapters_from_json(json.dumps(d2), base, series_url)
-                        if not new: break
-                        before = len(chs)
-                        chs.update(new)
-                        if len(chs) == before: break
-                    break
-            except Exception:
-                continue
-
-        if not chs:
-            try:
-                html = self.fetch_html(series_url)
-                if html:
-                    m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html)
-                    if m:
-                        build_id = m.group(1)
-                        next_url = f"{base}/_next/data/{build_id}/series/{slug}.json"
-                        data     = self.fetch_json(next_url)
-                        if data:
-                            chs.update(self._chapters_from_json(json.dumps(data), base, series_url))
-            except Exception:
-                pass
-
-        return chs
-
-    def _chapters_from_json(self, text: str, base: str, series_url: str) -> dict:
-        chs = {}
-        # أنماط شائعة للروابط في JSON
-        for m in re.finditer(
-            r'"(?:href|url|link|slug|chapterSlug)"\s*:\s*"([^"]*(?:chapter|ch)[^"]*)"',
-            text, re.IGNORECASE
-        ):
-            href = m.group(1).replace('\\u002F', '/').replace('\\', '')
-            if not href.startswith('http'):
-                href = urljoin(base, href)
-            nm = re.search(r'(?:chapter[s]?|ch)[/-](\d+(?:\.\d+)?)', href, re.I)
-            if nm:
+            def fetch_one(url: str) -> list[str]:
                 try:
-                    chs[float(nm.group(1))] = href
+                    resp = self.scraper.get(url, headers=HEADERS, timeout=12)
+                    if resp.status_code != 200:
+                        return []
+                    # فقط الفصول الخاصة بهذه السلسلة
+                    slug_encoded = slug.replace("'", "%27").replace("'", "%27")
+                    locs = re.findall(
+                        r"<loc>(https://vortexscans\.org/series/[^<]+/chapter-[^<]+)</loc>",
+                        resp.text,
+                    )
+                    # فلتر بالـ slug (مع مراعاة أن الـ ' قد يكون encoded أو raw)
+                    matched = []
+                    for loc in locs:
+                        series_part = loc.split("/chapter-")[0].split("/series/")[-1]
+                        # مقارنة slugs بعد إزالة الـ apostrophe والـ encode
+                        s_clean = series_part.replace("%27", "'").replace("'", "")
+                        t_clean = slug.replace("'", "").replace("'", "")
+                        if s_clean.lower() == t_clean.lower():
+                            matched.append(loc)
+                    return matched
                 except Exception:
-                    pass
+                    return []
 
-        # أنماط rقم الفصل المباشر
-        for m in re.finditer(
-            r'"(?:chapter_number|chapterNumber|number|num)"\s*:\s*(\d+(?:\.\d+)?)',
-            text
-        ):
-            num = float(m.group(1))
-            if num not in chs:
-                # بناء رابط تخميني
-                slug_m = re.search(r'"(?:slug|chapterSlug)"\s*:\s*"([^"]+)"', text[max(0, m.start()-200):m.end()+200])
-                if slug_m:
-                    href = f"{series_url.rstrip('/')}/{slug_m.group(1)}"
-                    chs[num] = href
-        return chs
+            # جلب كل السيتمابات بشكل متوازي
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futures = {ex.submit(fetch_one, u): u for u in sitemap_urls}
+                for f in as_completed(futures):
+                    found = f.result()
+                    for url in found:
+                        m = _NUM_RE.search(url)
+                        if m:
+                            try:
+                                num = float(m.group(1))
+                                if num > 0 and num not in all_chs:
+                                    all_chs[num] = {
+                                        "url": url,
+                                        "locked": False,
+                                        "reason": "sitemap",
+                                    }
+                            except Exception:
+                                pass
 
-    def _from_next(self, soup, series_url: str) -> dict:
-        nd = soup.find('script', id='__NEXT_DATA__')
-        if not nd:
-            return {}
-        try:
-            text = json.dumps(json.loads(nd.string))
-            parsed = urlparse(series_url)
-            base   = f"{parsed.scheme}://{parsed.netloc}"
-            return self._chapters_from_json(text, base, series_url)
-        except Exception:
-            return {}
+        except Exception as e:
+            print(f"[Vortex] sitemap error: {e}")
 
-    def _from_html(self, soup, series_url: str) -> dict:
-        chs    = {}
+        return all_chs
+
+    def _from_html_links(self, soup: BeautifulSoup, series_url: str) -> dict[float, dict]:
+        chs = {}
         parsed = urlparse(series_url)
         base   = f"{parsed.scheme}://{parsed.netloc}"
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            if not href.startswith('http'):
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not href.startswith("http"):
                 href = urljoin(base, href)
-            if 'vortexscans' not in href:
+            if "vortexscans" not in href:
                 continue
-            m = re.search(r'(?:chapter[s]?|ch)[/-](\d+(?:\.\d+)?)', href, re.I)
+            m = _NUM_RE.search(href)
             if m:
                 try:
-                    chs[float(m.group(1))] = href
+                    num = float(m.group(1))
+
+                    # فحص القفل من العنصر الأب
+                    locked = False
+                    parent = a.parent
+                    if parent:
+                        parent_html = str(parent)
+                        locked = bool(
+                            parent.select_one("[class*='lock'], [class*='premium'], .fa-lock")
+                            or re.search(r'\block\b|\bpremium\b|\bpaid\b', parent_html, re.I)
+                        )
+                    chs[num] = {"url": href, "locked": locked, "reason": "html-link"}
                 except Exception:
                     pass
         return chs
 
-    def _extract_from_html_str(self, html: str, base_url: str) -> dict:
-        return self._from_html(BeautifulSoup(html, 'html.parser'), base_url)
-
-    def get_latest_chapter(self, url: str):
-        import asyncio
-        loop   = asyncio.new_event_loop()
-        result = loop.run_until_complete(self.get_all_chapters(url))
-        loop.close()
-        return max(result.keys()) if result else None
+    async def get_latest_chapter(self, series_url: str) -> Optional[float]:
+        chs = await self.get_all_chapters(series_url)
+        return max(chs.keys()) if chs else None
