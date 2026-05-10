@@ -706,7 +706,7 @@ async def list_providers(interaction: discord.Interaction):
         "AC.QQ • Kuaikan • Piccoma • iQiyi Manhua"
     ))
     em.add_field(name="🇸🇦 عربية", inline=False, value=(
-        "Mangalek • 3asq • Manga-ar • Gmanga • Arabsama • وغيرها"
+        "**LekManga** • Mangalek • 3asq • Manga-ar • Gmanga • Arabsama • وغيرها"
     ))
     em.add_field(name="⚡ WordPress Madara (150+ موقع)", inline=False, value=(
         "Flamescans • Reaperscans • Toonily • Zinmanga • Manhwaclan\n"

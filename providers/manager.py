@@ -19,6 +19,7 @@ from .arabic_provider import ArabicProvider
 from .mangaplus_provider import MangaPlusProvider
 from .bilibili_provider import BilibiliProvider
 from .kakao_provider import KakaoProvider
+from .lekmanga_provider import LekMangaProvider
 from .raw_providers import (
     AcQQProvider, KuaikanProvider, LineMangaProvider,
     PiccomaProvider, IqiyiProvider,
@@ -48,6 +49,7 @@ class ProviderManager:
         self.mangaplus   = MangaPlusProvider()
         self.bilibili    = BilibiliProvider()
         self.kakao       = KakaoProvider()
+        self.lekmanga    = LekMangaProvider()
         self.acqq        = AcQQProvider()
         self.kuaikan     = KuaikanProvider()
         self.linemanga   = LineMangaProvider()
@@ -73,6 +75,8 @@ class ProviderManager:
         self.bato_sites    = ["bato.to", "batotoo.com", "dto.to", "bato.site"]
         self.comick_sites  = ["comick.fun", "comick.io", "comick.cc", "comick.app"]
         self.mangafire_sites = ["mangafire.to"]
+
+        self.lekmanga_sites = ["lekmanga.net", "lekmanga.com"]
 
         self.arabic_sites = [
             "mangalek.com",
@@ -224,6 +228,9 @@ class ProviderManager:
         if "weebcentral.com" in url_lower:                    return self.weebcentral
         if any(x in url_lower for x in ["tcbscans", "tcb-scans"]): return self.tcbscans
 
+        # ── LekManga ─────────────────────────────────────────────────────
+        if any(s in url_lower for s in self.lekmanga_sites):  return self.lekmanga
+
         # ── المواقع العربية ───────────────────────────────────────────────
         if any(s in url_lower for s in self.arabic_sites):    return self.arabic
         # مخصصة عربية
@@ -353,7 +360,7 @@ class ProviderManager:
 
         if pname in ("Generic", "Madara", "Arabic", "MangaFire",
                      "Bato", "Asura", "Vortex", "MangaPill",
-                     "Manganato", "WeebCentral"):
+                     "Manganato", "WeebCentral", "LekManga"):
             try:
                 scraper = PaginatedScraper(
                     fetch_fn=self.generic.fetch_html,
