@@ -80,27 +80,41 @@ class VortexProvider(BaseProvider):
                 return []
             soup   = BeautifulSoup(html, "html.parser")
             images = []
+            seen   = set()
 
-            # 1. img tags with upload/series
+            # 1. img tags مع data-reader-page-image (الصور الحقيقية للفصل)
+            for img in soup.find_all("img", attrs={"data-reader-page-image": True}):
+                src = (img.get("src") or img.get("data-src") or "").strip()
+                if src and src not in seen:
+                    seen.add(src)
+                    images.append(src)
+            if images:
+                return images
+
+            # 2. كل img مع upload/series في الـ src
             for img in soup.find_all("img"):
                 src = (img.get("src") or img.get("data-src") or "").strip()
-                if "upload/series" in src and src not in images:
+                if not src or src in seen:
+                    continue
+                if "upload/series" in src:
                     if "wsrv.nl" in src:
                         m = re.search(r"url=([^&]+)", src)
                         if m:
                             import urllib.parse
                             src = urllib.parse.unquote(m.group(1))
+                    seen.add(src)
                     images.append(src)
             if images:
                 return images
 
-            # 2. regex direct
+            # 3. regex على كامل HTML (يتعامل مع double slash)
             for p in re.findall(
-                r"https?://(?:storage\.)?vortexscans\.org/upload/series/[^\"'\s<>]+?"
+                r"https?://(?:storage\.)?vortexscans\.org/+upload/series/[^\"'\s<>]+"
                 r"\.(?:webp|jpg|jpeg|png)",
                 html, re.I,
             ):
-                if p not in images:
+                if p not in seen:
+                    seen.add(p)
                     images.append(p)
             return images
 

@@ -248,15 +248,45 @@ class LekMangaProvider(BaseProvider):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._sync_get_images, url)
 
+    def _try_fetch_chapter_page(self, url: str) -> Optional[str]:
+        """محاولة جلب صفحة الفصل بكل الأساليب المتاحة."""
+        from .base_provider import BaseProvider
+        bp = BaseProvider()
+
+        # 1. base_provider multi-method fetch
+        html = bp.fetch_html(url)
+        if html and len(html) > 1000:
+            return html
+
+        # 2. curl_cffi بأشكال مختلفة
+        try:
+            from curl_cffi import requests as cfreq
+            for imp in ["chrome124", "chrome131", "chrome120", "safari18_0", "edge101"]:
+                try:
+                    s = cfreq.Session(impersonate=imp)
+                    s.get(HOME_URL, timeout=12)  # تسخين
+                    r = s.get(url, headers={
+                        "Referer": HOME_URL,
+                        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                        "Accept-Language": "ar,en;q=0.8",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "same-origin",
+                    }, timeout=20)
+                    if r.status_code == 200 and len(r.text) > 1000:
+                        return r.text
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+
+        return None
+
     def _sync_get_images(self, url: str) -> list:
         try:
-            session = self._get_cf_session()
-            r = session.get(
-                url, timeout=20,
-                headers={"Referer": HOME_URL}
-            )
-            if r.status_code == 200 and len(r.text) > 1000:
-                soup = BeautifulSoup(r.text, "html.parser")
+            html = self._try_fetch_chapter_page(url)
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
                 images = []
                 for sel in [
                     "#readerarea img",
@@ -264,6 +294,7 @@ class LekMangaProvider(BaseProvider):
                     ".page-break img",
                     "div.wp-manga-chapter-img img",
                     "img[data-src]",
+                    "img[src]",
                 ]:
                     for img in soup.select(sel):
                         src = (
@@ -276,8 +307,9 @@ class LekMangaProvider(BaseProvider):
                                 images.append(src)
                     if images:
                         return images
-            elif r.status_code == 403:
-                print(f"[LekManga] Chapter page still blocked: {url}")
+            else:
+                # محجوب بـ Cloudflare Bot Management — غير قابل للتجاوز بدون متصفح حقيقي
+                print(f"[LekManga] ⚠️ صفحات الفصول محجوبة بـ Cloudflare — التحميل غير متاح لـ {url}")
         except Exception as e:
             print(f"[LekManga] get_images error: {e}")
         return []

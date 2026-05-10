@@ -8,11 +8,12 @@ from urllib.parse import urljoin, urlparse
 class AsuraProvider(BaseProvider):
     """مزود AsuraScans - يستخدم Next.js مع بيانات JSON مضمّنة"""
 
-    DOMAINS = ['asurascans.com', 'asura.gg', 'asuracomics.com', 'asuratoon.com']
+    DOMAINS = ['asurascans.com', 'asura.gg', 'asuracomics.com', 'asuratoon.com',
+               'asuracomic.net', 'asura.nacm.xyz']
 
     def __init__(self):
         super().__init__()
-        self.base_url = "https://asurascans.com"
+        self.base_url = "https://asuracomic.net"
         self.headers['Referer'] = self.base_url + '/'
 
     def _normalize_url(self, url: str) -> str:

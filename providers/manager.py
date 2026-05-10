@@ -217,7 +217,8 @@ class ProviderManager:
 
         # ── مزودات مخصصة ─────────────────────────────────────────────────
         if any(x in url_lower for x in ["asurascans", "asura.gg", "asuracomics",
-                                         "asuratoon", "asura.nacm.xyz"]):
+                                         "asuratoon", "asura.nacm.xyz", "asuracomic.net",
+                                         "asuracomic"]):
             return self.asura
         if "vortexscans" in url_lower:                        return self.vortex
         if any(x in url_lower for x in ["qimanhwa", "qimanhua"]): return self.qimanhwa

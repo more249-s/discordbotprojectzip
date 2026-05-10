@@ -101,6 +101,43 @@ def _extract_from_html(html: str, base_url: str, detect_lock: bool = True) -> di
     return result
 
 
+def _extract_cdn_images(html: str) -> list[str]:
+    """
+    استخراج صور الفصل من صفحة Naver.
+    الصور الحقيقية تستضيفها CDN: image-comic.pstatic.net
+    """
+    # الطريقة الأولى: regex على CDN الرئيسي
+    found = re.findall(
+        r'https://image-comic\.pstatic\.net/webtoon/[^\"\'\s<>\\]+',
+        html,
+    )
+    # فلتر thumbnails وعناوين الأغلفة
+    imgs = []
+    seen = set()
+    for u in found:
+        u = u.rstrip("\\").rstrip('"').strip()
+        if "thumbnail" in u.lower():
+            continue
+        if u not in seen:
+            seen.add(u)
+            imgs.append(u)
+    if imgs:
+        return imgs
+
+    # الطريقة الثانية: img tags بـ src حقيقية (ليست placeholder)
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        src = (img.get("src") or img.get("data-src") or "").strip()
+        if (src.startswith("http")
+                and "pstatic" in src
+                and "transparency" not in src
+                and "thumbnail" not in src.lower()
+                and src not in seen):
+            seen.add(src)
+            imgs.append(src)
+    return imgs
+
+
 def _detect_total_pages(html: str) -> int:
     """اكتشاف عدد صفحات الـ pagination."""
     soup  = BeautifulSoup(html, "html.parser")
@@ -146,25 +183,29 @@ class NaverProvider(BaseProvider):
         loop = asyncio.get_event_loop()
 
         def _scrape():
+            # استخرج titleId و no من الرابط
+            titleId = re.search(r'titleId=(\d+)', url)
+            no      = re.search(r'[?&]no=(\d+)', url)
+
+            if titleId and no:
+                # Desktop viewer يحتوي على روابط CDN الحقيقية للصور
+                desktop_url = (
+                    f"https://comic.naver.com/webtoon/detail"
+                    f"?titleId={titleId.group(1)}&no={no.group(1)}"
+                )
+                html = self._get(desktop_url)
+                if html:
+                    imgs = _extract_cdn_images(html)
+                    if imgs:
+                        return imgs
+
+            # Fallback: mobile page
             html = self._get(_to_mobile(url))
             if not html:
                 html = self._get(url)
             if not html:
                 return []
-            soup = BeautifulSoup(html, "html.parser")
-            for sel in [
-                ".wt_viewer img", ".viewer_lst img",
-                "#comic_view_area img", ".content_viewer img",
-                ".wrap_viewer img",
-            ]:
-                imgs = []
-                for img in soup.select(sel):
-                    src = (img.get("src") or img.get("data-src") or "").strip()
-                    if src.startswith("http"):
-                        imgs.append(src)
-                if imgs:
-                    return imgs
-            return []
+            return _extract_cdn_images(html)
 
         return await loop.run_in_executor(None, _scrape)
 
