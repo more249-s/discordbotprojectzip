@@ -20,6 +20,7 @@ from gemini_client import GeminiClient
 from keep_alive import keep_alive
 from manga_downloader import MangaDownloader
 from providers.manager import ProviderManager
+from providers.lekmanga_provider import CloudflareBlockedError
 from user_system import owner_only, vip_only, user_only, get_rank, RANK_LABELS, RANK_COLORS
 
 C_BLUE   = discord.Color.from_rgb(88, 101, 242)
@@ -614,6 +615,26 @@ async def download_cmd(
             state["phase"] = "❌ فشل التحميل — لم يُعثر على الصور"
             state["color"] = C_RED
             await msg.edit(embed=build_em())
+
+    except CloudflareBlockedError:
+        state["phase"] = "⛔ محجوب بـ Cloudflare"
+        state["color"] = C_RED
+        await msg.edit(embed=build_em())
+        await interaction.followup.send(embed=discord.Embed(
+            title="⛔ lekmanga.net — التحميل غير متاح",
+            description=(
+                "**lekmanga.net** يستخدم **Cloudflare Bot Management** الذي يحجب جميع "
+                "الطلبات الآلية على صفحات القراءة، بما فيها المتصفحات المُحاكاة.\n\n"
+                "✅ **ما يعمل بشكل طبيعي:**\n"
+                "• تتبع الفصول الجديدة (`/track`)\n"
+                "• إشعارات الفصول عبر الرادار\n\n"
+                "❌ **ما لا يمكن تجاوزه حالياً:**\n"
+                "• تحميل صور الفصول من lekmanga.net\n\n"
+                "**بديل مقترح:** استخدم رابط المانجا من موقع آخر مدعوم "
+                "(MangaDex, Asura, Vortex, Naver)."
+            ),
+            color=C_RED,
+        ), ephemeral=True)
 
     except Exception as e:
         state["phase"] = f"❌ خطأ: {str(e)[:80]}"

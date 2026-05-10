@@ -1,10 +1,8 @@
 """
 lekmanga_provider.py — مزود lekmanga.net المتخصص
 
-يتحايل على Cloudflare باستخدام:
-  1. admin-ajax.php (manga_get_chapters) للحصول على الفصول
-  2. madara_load_more للبحث عن المانجا وآخر فصل
-  3. curl_cffi chrome120 impersonation لجلب الصور
+يستخدم Madara AJAX لجلب الفصول (admin-ajax.php).
+صفحات القراءة محجوبة بـ Cloudflare Bot Management — التحميل غير متاح.
 
 نمط روابط الفصول: {manga_url}{chapter_num}/
 """
@@ -16,6 +14,10 @@ from typing import Optional
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from .base_provider import BaseProvider
+
+
+class CloudflareBlockedError(Exception):
+    """يُرفع عندما يحجب Cloudflare طلبات التحميل."""
 
 SITE = "lekmanga.net"
 AJAX_URL = "https://lekmanga.net/wp-admin/admin-ajax.php"
@@ -283,33 +285,13 @@ class LekMangaProvider(BaseProvider):
         return None
 
     def _sync_get_images(self, url: str) -> list:
-        try:
-            html = self._try_fetch_chapter_page(url)
-            if html:
-                soup = BeautifulSoup(html, "html.parser")
-                images = []
-                for sel in [
-                    "#readerarea img",
-                    ".reading-content img",
-                    ".page-break img",
-                    "div.wp-manga-chapter-img img",
-                    "img[data-src]",
-                    "img[src]",
-                ]:
-                    for img in soup.select(sel):
-                        src = (
-                            img.get("data-src") or
-                            img.get("data-lazy-src") or
-                            img.get("src") or ""
-                        ).strip()
-                        if src.startswith("http") and src not in images:
-                            if not any(x in src.lower() for x in ["logo", "banner", "icon", "avatar"]):
-                                images.append(src)
-                    if images:
-                        return images
-            else:
-                # محجوب بـ Cloudflare Bot Management — غير قابل للتجاوز بدون متصفح حقيقي
-                print(f"[LekManga] ⚠️ صفحات الفصول محجوبة بـ Cloudflare — التحميل غير متاح لـ {url}")
-        except Exception as e:
-            print(f"[LekManga] get_images error: {e}")
-        return []
+        """
+        صفحات قراءة lekmanga.net محجوبة بـ Cloudflare Bot Management.
+        لا يوجد أسلوب HTTP (curl_cffi / tls-client / cloudscraper) قادر على تجاوزه،
+        ولا يتوفر متصفح حقيقي في بيئة التشغيل الحالية.
+        """
+        print(f"[LekManga] ⛔ صفحات الفصول محجوبة بـ Cloudflare Bot Management — {url}")
+        raise CloudflareBlockedError(
+            "lekmanga.net يستخدم Cloudflare Bot Management الذي يحجب كل الطلبات الآلية. "
+            "التحميل غير متاح حالياً. تتبع الفصول الجديدة لا يزال يعمل بشكل طبيعي."
+        )

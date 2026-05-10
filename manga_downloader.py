@@ -15,6 +15,7 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 from providers.manager import ProviderManager
+from providers.lekmanga_provider import CloudflareBlockedError
 from smart_stitch import smart_stitch_from_zip
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -46,7 +47,10 @@ class MangaDownloader:
     # ── تحميل فصل ─────────────────────────────────────────────────────────
     async def download_chapter(self, url: str, chapter_title: str, progress_callback=None, **kwargs):
         loop     = asyncio.get_event_loop()
-        img_urls = await self.provider_manager.get_images(url)
+        try:
+            img_urls = await self.provider_manager.get_images(url)
+        except CloudflareBlockedError:
+            raise
         if not img_urls:
             return None
 
