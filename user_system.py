@@ -1,8 +1,8 @@
 """
 نظام صلاحيات المستخدمين — 3 رتب:
   3 = Owner  (من ALLOWED_USER_IDS — مدمج في الكود)
-  2 = VIP    (تحميل مانجا + كريبتو أساسي)
-  1 = User   (بحث + سعر فقط)
+  2 = VIP    (تحميل مانجا + SmartStitch + Gemini AI)
+  1 = User   (بحث + قراءة)
   0 = مرفوض  (لا يقدر يستعمل البوت)
 """
 
@@ -40,46 +40,40 @@ def is_owner(user_id: int) -> bool:
     return user_id in Config.ALLOWED_USER_IDS
 
 
+# ── مساعد لإرسال رسائل ephemeral بأمان ─────────────────────────────────
+async def _safe_reply(interaction: discord.Interaction, content: str):
+    """إرسال رسالة إلى interaction بدون crash حتى لو انتهت صلاحيتها."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content, ephemeral=True)
+        else:
+            await interaction.followup.send(content, ephemeral=True)
+    except discord.NotFound:
+        pass  # Interaction expired — لا يهم
+    except Exception:
+        pass
+
+
 # ── فحص الصلاحية ───────────────────────────────────────────────────────────
 async def check_rank(interaction: discord.Interaction, min_rank: int) -> bool:
-    """
-    يتحقق هل للمستخدم رتبة كافية.
-    يُرسل رسالة خطأ تلقائياً إذا كان الوصول مرفوضاً.
-    """
     rank = await get_rank(interaction.user.id)
     if rank >= min_rank:
         return True
 
     if rank == 0:
         msg = "❌ ليس لديك صلاحية استخدام هذا البوت.\nتواصل مع المالك للحصول على وصول."
-    elif rank < min_rank:
-        msg = f"❌ هذا الأمر يحتاج رتبة **{RANK_LABELS.get(min_rank, str(min_rank))}** أو أعلى."
     else:
-        msg = "❌ وصول مرفوض."
+        msg = f"❌ هذا الأمر يحتاج رتبة **{RANK_LABELS.get(min_rank, str(min_rank))}** أو أعلى."
 
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(msg, ephemeral=True)
-        else:
-            await interaction.followup.send(msg, ephemeral=True)
-    except Exception:
-        pass
+    await _safe_reply(interaction, msg)
     return False
 
 
 # ── مزخرف (Decorator) لفحص الرتبة ─────────────────────────────────────────
 def require_rank(min_rank: int):
-    """
-    مزخرف لأوامر slash — يُلغي تنفيذ الأمر إذا كانت الرتبة غير كافية.
-    الاستخدام:
-        @require_rank(2)   # يحتاج VIP أو أعلى
-        async def my_cmd(self, interaction, ...):
-            ...
-    """
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            # interaction قد تكون args[0] (function عادية) أو args[1] (method كلاس)
             interaction = None
             for a in args:
                 if isinstance(a, discord.Interaction):
@@ -94,15 +88,13 @@ def require_rank(min_rank: int):
     return decorator
 
 
-# ── ديكوراتور خاص بالأوامر المباشرة على bot.tree ──────────────────────────
+# ── ديكوراتورات app_commands.check ──────────────────────────────────────────
 def owner_only():
     """يُرجع app_commands.check للأوامر التي تستخدم @bot.tree.command"""
     async def predicate(interaction: discord.Interaction) -> bool:
         ok = is_owner(interaction.user.id)
         if not ok:
-            await interaction.response.send_message(
-                "❌ هذا الأمر للمالك فقط.", ephemeral=True
-            )
+            await _safe_reply(interaction, "❌ هذا الأمر للمالك فقط.")
         return ok
     return app_commands.check(predicate)
 
@@ -113,10 +105,9 @@ def vip_only():
         rank = await get_rank(interaction.user.id)
         ok   = rank >= 2
         if not ok:
-            await interaction.response.send_message(
-                "❌ هذا الأمر يحتاج رتبة ⭐ VIP أو أعلى.\n"
-                "تواصل مع المالك للترقية.",
-                ephemeral=True
+            await _safe_reply(
+                interaction,
+                "❌ هذا الأمر يحتاج رتبة ⭐ VIP أو أعلى.\nتواصل مع المالك للترقية.",
             )
         return ok
     return app_commands.check(predicate)
@@ -128,10 +119,9 @@ def user_only():
         rank = await get_rank(interaction.user.id)
         ok   = rank >= 1
         if not ok:
-            await interaction.response.send_message(
-                "❌ ليس لديك صلاحية استخدام هذا البوت.\n"
-                "تواصل مع المالك للحصول على وصول.",
-                ephemeral=True
+            await _safe_reply(
+                interaction,
+                "❌ ليس لديك صلاحية استخدام هذا البوت.\nتواصل مع المالك للحصول على وصول.",
             )
         return ok
     return app_commands.check(predicate)

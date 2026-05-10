@@ -877,35 +877,24 @@ class RadarCog(commands.Cog):
 
 
     # ── manga_panel ────────────────────────────────────────────────────────
-    @app_commands.command(name="manga_panel", description="[VIP] Integrated control panel to browse and download chapters.")
-    @app_commands.describe(url="Main URL of the manga/manhwa")
+    @app_commands.command(name="manga_panel", description="[VIP] لوحة تحكم شاملة لتصفح وتحميل فصول المانجا")
+    @app_commands.describe(url="رابط المانجا/المانهوا الرئيسي")
     @vip_only()
     async def manga_panel_cmd(self, interaction: discord.Interaction, url: str):
+        # defer فوري لتجنب انتهاء صلاحية الـ interaction (3 ثواني)
+        is_component = interaction.type == discord.InteractionType.component
         if not interaction.response.is_done():
-            await interaction.response.send_message(
-                f"```yaml\n"
-                f"  Fetching chapters...\n"
-                f"  Site : {_domain(url)}\n"
-                f"  Please wait...\n"
-                f"```"
-            )
-        else:
-            await interaction.followup.send(
-                f"```yaml\n"
-                f"  Fetching chapters...\n"
-                f"  Site : {_domain(url)}\n"
-                f"  Please wait...\n"
-                f"```",
-                ephemeral=True
-            )
+            await interaction.response.defer()
+
         try:
             prov_name = self.provider_manager.get_provider_name(url)
 
-            # جلب الفصول + صورة الغلاف + معلومات الإقفال بالتوازي
-            chs_task    = self.provider_manager.get_chapters_with_lock_info(url)
-            cover_task  = self.provider_manager.get_series_cover(url)
-            chs_rich, cover_url = await asyncio.gather(chs_task, cover_task,
-                                                        return_exceptions=True)
+            # جلب الفصول + صورة الغلاف بالتوازي
+            chs_task   = self.provider_manager.get_chapters_with_lock_info(url)
+            cover_task = self.provider_manager.get_series_cover(url)
+            chs_rich, cover_url = await asyncio.gather(
+                chs_task, cover_task, return_exceptions=True
+            )
 
             if isinstance(chs_rich, Exception):
                 chs_rich = {}
@@ -921,20 +910,22 @@ class RadarCog(commands.Cog):
                     if info.get("locked"):
                         locked_set.add(num)
                 else:
-                    chs[num] = info   # fallback: info هو URL مباشرة
+                    chs[num] = info
 
             if not chs:
-                return await interaction.edit_original_response(
-                    content=(
+                em_fail = discord.Embed(
+                    title="❌ لم يُعثر على فصول",
+                    description=(
                         f"```yaml\n"
-                        f"  Status   : FAILED\n"
                         f"  Site     : {_domain(url)}\n"
                         f"  Provider : {prov_name}\n"
-                        f"  Error    : لم يُعثر على فصول\n"
+                        f"  Error    : تعذّر جلب الفصول\n"
                         f"             تحقق من الرابط أو حاول لاحقاً\n"
                         f"```"
-                    )
+                    ),
+                    color=C_FAIL,
                 )
+                return await interaction.followup.send(embed=em_fail, ephemeral=True)
 
             view = MangaPanelView(
                 self.bot, self.downloader, self.provider_manager,
@@ -944,23 +935,27 @@ class RadarCog(commands.Cog):
                 cover_url=cover_url,
                 locked_chapters=locked_set,
             )
-            lock_info = f"  🔒 مدفوع: {len(locked_set)}" if locked_set else "  🔓 كل الفصول مجانية"
             em = view.build_embed(
                 f"✅ وُجد {len(chs)} فصل  ·  "
                 f"Ch.{_lbl(min(chs))} → Ch.{_lbl(max(chs))}"
                 + (f"  ·  🔒 {len(locked_set)} مدفوع" if locked_set else "")
             )
-            if not interaction.response.is_done() or interaction.type == discord.InteractionType.component:
-                 # This is tricky for component interactions from dropdown
-                 await interaction.followup.send(embed=em, view=view)
-            else:
-                await interaction.edit_original_response(content=None, embed=em, view=view)
+            await interaction.followup.send(embed=em, view=view)
+
         except Exception as e:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"Error: {e}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"Error: {e}", ephemeral=True)
-            import traceback; traceback.print_exc()
+            try:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="❌ خطأ",
+                        description=f"```\n{str(e)[:500]}\n```",
+                        color=C_FAIL,
+                    ),
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            import traceback
+            traceback.print_exc()
 
 
 async def setup(bot):

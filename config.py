@@ -13,22 +13,25 @@ def get_int(key, default=0):
         return default
 
 class Config:
-    DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-    BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-    TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-    
-    # Google Drive
-    GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+    DISCORD_TOKEN       = os.getenv("DISCORD_TOKEN")
+    GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
+    TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY")
+
+    GOOGLE_DRIVE_FOLDER_ID      = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
     GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")
-    
+    GOFILE_TOKEN                = os.getenv("GOFILE_TOKEN")
+
     GEMINI_CHANNEL_ID = get_int("DISCORD_GEMINI_CHANNEL_ID")
-    GUILD_ID = get_int("DISCORD_GUILD_ID")
-    ERROR_CHANNEL_ID = get_int("DISCORD_ERROR_CHANNEL_ID")
-    
-    ALLOWED_USER_IDS = [int(uid.strip()) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip() and uid.strip().isdigit()]
+    GUILD_ID          = get_int("DISCORD_GUILD_ID")
+    ERROR_CHANNEL_ID  = get_int("DISCORD_ERROR_CHANNEL_ID")
+
+    ALLOWED_USER_IDS = [
+        int(uid.strip())
+        for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
+        if uid.strip() and uid.strip().isdigit()
+    ]
+
+    WEB_PANEL_SECRET = os.getenv("WEB_PANEL_SECRET", "catbi-panel-2025")
 
     @classmethod
     def is_allowed(cls, user_id):
